@@ -1,4 +1,4 @@
-# HHVM-log
+# HHVM-verifier
 
 This is a component of [Orochi](https://github.com/naizhengtan/orochi) project.
 

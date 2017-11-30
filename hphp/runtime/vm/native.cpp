@@ -212,6 +212,7 @@ void callFunc(const Func* func, void *ctx,
       return;
 
     case KindOfUninit:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -295,6 +296,7 @@ bool coerceFCallArgs(TypedValue* args,
       case KindOfNull:
       case KindOfStaticString:
       case KindOfRef:
+      case KindOfMulti:
       case KindOfClass:
         not_reached();
     }
@@ -379,7 +381,10 @@ TypedValue* functionWrapper(ActRec* ar) {
   }
 
   assert(rv.m_type != KindOfUninit);
+  // cheng-hack: used for multi-round NativeImpl call
+  if (!ar->isInMultiRound()) {
   frame_free_locals_no_this_inl(ar, func->numLocals(), &rv);
+  }
   tvCopy(rv, ar->m_r);
   return &ar->m_r;
 }
@@ -407,7 +412,8 @@ TypedValue* methodWrapper(ActRec* ar) {
       if (isStatic) {
         throw_instance_method_fatal(getInvokeName(ar)->data());
       }
-      ctx = ar->getThis();
+      // cheng-hack: no idea
+      ctx = ar->getThisSingle();
     } else {
       if (!isStatic) {
         throw_instance_method_fatal(getInvokeName(ar)->data());
@@ -422,10 +428,13 @@ TypedValue* methodWrapper(ActRec* ar) {
   }
 
   assert(rv.m_type != KindOfUninit);
+  // cheng-hack: used for multi-round NativeImpl call
+  if (!ar->isInMultiRound()) {
   if (isStatic) {
     frame_free_locals_no_this_inl(ar, func->numLocals(), &rv);
   } else {
     frame_free_locals_inl(ar, func->numLocals(), &rv);
+  }
   }
   tvCopy(rv, ar->m_r);
   return &ar->m_r;

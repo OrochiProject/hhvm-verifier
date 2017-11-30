@@ -382,6 +382,7 @@ inline Type Type::cns(const TypedValue& tv) {
       case KindOfObject:
       case KindOfResource:
       case KindOfRef:
+      case KindOfMulti:
         always_assert(false && "Invalid KindOf for constant TypedValue");
     }
     not_reached();

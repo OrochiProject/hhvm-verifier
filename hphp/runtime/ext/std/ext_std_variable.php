@@ -71,6 +71,71 @@ function is_object(mixed $var): bool;
 <<__Native, __ParamCoerceModeFalse>>
 function is_resource(mixed $var): bool;
 
+/*
+ * cheng-hack: multi-value APIs
+ */
+<<__Native>>
+function add_multi(mixed $var, mixed $val,
+               int $req_num): mixed;
+<<__Native>>
+function gen_multi(array $arr): mixed;
+<<__Native>>
+function set_batch_upper_bound(int $size): void;
+<<__Native>>
+function is_multi(mixed $var) : bool;
+<<__Native>>
+function split_multi(mixed $var) : array;
+<<__Native>>
+function getIthVal(mixed $var, int $i) : mixed;
+<<__Native>>
+function merge_multi(mixed $var) : mixed;
+<<__Native>>
+function rewrite_select_sql(mixed $var, int $rid, int $opnum, int $query_num) : mixed;
+<<__Native>>
+function check_write_sql(mixed $var, int $rid, int $opnum) : bool;
+<<__Native>>
+function get_seqnum_from_opmap(int $rid, int $opnum) : int;
+<<__Native>>
+function is_verify() : bool;
+<<__Native>>
+function is_single_mode_on() : bool;
+<<__Native>>
+function is_res_req() : bool;
+<<__Native>>
+function set_res_req(bool $is_res) : void;
+<<__Native>>
+function get_batch_size() : int;
+<<__Native>>
+function set_batch_size(int $size) : void;
+<<__Native>>
+function get_ins_counter() : int;
+<<__Native>>
+function get_multi_ins_counter() : int;
+<<__Native>>
+function get_classified_ins_counter() : array;
+<<__Native>>
+function get_classified_mins_counter() : array;
+<<__Native>>
+function replay_dump_output(string $path) : void;
+<<__Native>>
+function veri_dump_output(string $path, mixed $req_no) : void;
+<<__Native>>
+function loop_var_capture(mixed &$loop_var, mixed &$capture_var, int $size) : void;
+<<__Native>>
+function loop_var_end(mixed &$loop_var, mixed &$capture_var) : void;
+<<__Native>>
+function set_should_count(bool $count) : void;
+<<__Native>>
+function MIC_to_MC(mixed $value) : mixed;
+<<__Native>>
+function MC_to_MIC(mixed $value) : mixed;
+<<__Native>>
+function sess_get_last_write (int $rid, int $opnum, mixed $sess_id) : mixed;
+<<__Native>>
+function sess_get_id (int $rid, int $opnum, bool $check) : mixed;
+<<__Native>>
+function check_maxop(int $rid, int $last_op_num) : bool;
+
 /* Finds whether the given variable is NULL.
  */
 <<__Native, __ParamCoerceModeFalse>>
@@ -126,6 +191,9 @@ function settype(mixed &$var,
 <<__Native>>
 function print_r(mixed $expression,
                  bool $ret = false): mixed;
+// cheng-hack:
+<<__Native>>
+function print_p(mixed $expression): mixed;
 
 <<__Native>>
 function var_export(mixed $expression,

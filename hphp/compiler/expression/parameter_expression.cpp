@@ -316,6 +316,7 @@ void ParameterExpression::compatibleDefault() {
         }
       /* fall through */
       case KindOfClass:
+      case KindOfMulti:
         break;
     }
     always_assert(false /* likely parser bug */);

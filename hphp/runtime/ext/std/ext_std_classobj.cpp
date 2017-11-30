@@ -220,7 +220,7 @@ Variant HHVM_FUNCTION(get_called_class) {
   ActRec* ar = cf();
   if (ar) {
     if (ar->hasThis()) {
-      return Variant(ar->getThis()->getClassName());
+      return Variant(ar->getThisDefault()->getClassName());
     }
     if (ar->hasClass()) {
       return Variant(ar->getClass()->preClass()->name(),

@@ -162,11 +162,23 @@ void ALWAYS_INLINE
 frame_free_locals_inl_no_hook(ActRec* fp, int numLocals) {
   frame_free_locals_helper_inl<unwinding>(fp, numLocals);
   if (fp->hasThis()) {
-    ObjectData* this_ = fp->getThis();
+    // cheng-hack:
+    if (UNLIKELY(fp->isMultiThis())) {
+      auto this_ = fp->getThisMulti();
+      if (unwinding) {
+        fp->setThisSingle(nullptr);
+      }
+      for (auto it : *this_) {decRefObj(it);}
+      // delete the multi_this structure
+      delete fp->m_multi_this;
+    } else {
+      // normal case
+    ObjectData* this_ = fp->getThisSingle();
     if (unwinding) {
-      fp->setThis(nullptr);
+      fp->setThisSingle(nullptr);
     }
     decRefObj(this_);
+    }
   }
 }
 
@@ -182,7 +194,13 @@ frame_free_inl(ActRec* fp, TypedValue* rv) { // For frames with no locals
   assert(!fp->hasInvName());
   assert(fp->m_varEnv == nullptr);
   assert(fp->hasThis());
-  decRefObj(fp->getThis());
+  // cheng-hack:
+  if (UNLIKELY(fp->isMultiThis())) {
+    for (auto it : *fp->getThisMulti()) {decRefObj(it);}
+  } else {
+    // normal case
+  decRefObj(fp->getThisSingle());
+  }
   EventHook::FunctionReturn(fp, *rv);
 }
 

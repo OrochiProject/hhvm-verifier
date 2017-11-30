@@ -128,6 +128,7 @@ size_t MemoryProfile::getSizeOfTV(const TypedValue* tv) {
   switch (tv->m_type) {
     DT_UNCOUNTED_CASE:
     case KindOfResource:
+    case KindOfMulti:
     case KindOfClass:
       return 0;
     case KindOfString:

@@ -23,6 +23,7 @@
 #include "hphp/runtime/base/string-data.h"
 #include "hphp/runtime/base/typed-value.h"
 #include "hphp/runtime/base/types.h"
+#include "hphp/runtime/base/multi-val.h"
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -115,7 +116,8 @@ inline void tvDecRefRefInternal(RefData* r) {
 
 // Assumes 'tv' is live
 inline void tvDecRefRef(TypedValue* tv) {
-  assert(tv->m_type == KindOfRef);
+  // used to be a BUG, this will crash the MultiVal's datastructure
+  always_assert(tv->m_type == KindOfRef);
   tvDecRefRefInternal(tv->m_data.pref);
 }
 
@@ -165,9 +167,10 @@ ALWAYS_INLINE void tvDecRefOnly(TypedValue* tv) {
 }
 
 // Assumes 'tv' is live
+// Assumes 'tv' is not multiVal
 inline TypedValue* tvBox(TypedValue* tv) {
   assert(tvIsPlausible(*tv));
-  assert(tv->m_type != KindOfRef);
+  always_assert(tv->m_type != KindOfRef); // cheng-hack
   tv->m_data.pref = RefData::Make(*tv);
   tv->m_type = KindOfRef;
   return tv;
@@ -244,6 +247,19 @@ inline void refCopy(const Ref fr, Ref& to) {
 inline void tvDup(const TypedValue& fr, TypedValue& to) {
   tvCopy(fr, to);
   tvRefcountedIncRef(&to);
+}
+
+// cheng-hack:
+inline void tvDupMulti(const TypedValue& fr, TypedValue& to) {
+  tvCopy(fr, to);
+  always_assert(fr.m_type == KindOfMulti); 
+  to.m_data.pmulti->incRefCount();
+}
+
+// cheng-hack:
+inline void tvDecRefMulti(TypedValue* tv) {
+  always_assert(tv->m_type == KindOfMulti);
+  tv->m_data.pmulti->decRefAndRelease();
 }
 
 /*
@@ -384,7 +400,7 @@ inline void cellSet(const Cell fr, Cell& to) {
 // Assumes 'to' and 'fr' are live
 // Assumes that 'fr->m_type == KindOfRef'
 inline void tvBind(const TypedValue* fr, TypedValue* to) {
-  assert(fr->m_type == KindOfRef);
+  always_assert(fr->m_type == KindOfRef); //cheng-hack
   DataType oldType = to->m_type;
   uint64_t oldDatum = to->m_data.num;
   refDup(*fr, *to);

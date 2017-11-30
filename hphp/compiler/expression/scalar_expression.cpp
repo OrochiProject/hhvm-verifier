@@ -94,6 +94,7 @@ ScalarExpression::ScalarExpression
       case KindOfObject:
       case KindOfResource:
       case KindOfRef:
+      case KindOfMulti:
       case KindOfClass:
         break;
     }

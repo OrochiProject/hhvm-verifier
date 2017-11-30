@@ -677,6 +677,7 @@ Variant HHVM_FUNCTION(file_put_contents,
     }
 
     case KindOfClass:
+    case KindOfMulti:
       not_reached();
   }
 

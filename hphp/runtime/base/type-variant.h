@@ -26,6 +26,7 @@
 #include "hphp/runtime/base/type-object.h"
 #include "hphp/runtime/base/type-resource.h"
 #include "hphp/runtime/base/type-string.h"
+#include "hphp/runtime/base/multi-val.h"
 
 #include <algorithm>
 #include <type_traits>
@@ -63,7 +64,7 @@ namespace HPHP {
  *
  */
 
-struct Variant : private TypedValue {
+struct Variant : public TypedValue {
   enum class NullInit {};
   enum class NoInit {};
   enum class CellCopy {};
@@ -104,6 +105,8 @@ struct Variant : private TypedValue {
   /* implicit */ Variant(ObjectData* v);
   /* implicit */ Variant(ResourceData* v);
   /* implicit */ Variant(RefData* r);
+  // cheng-hack:
+  /* implicit */ Variant(MultiVal* r);
 
   template <typename T>
   explicit Variant(const SmartPtr<T>& ptr) : Variant(ptr.get()) { }
@@ -493,6 +496,7 @@ struct Variant : private TypedValue {
       case KindOfRef:
         return m_data.pref->var()->isIntVal();
       case KindOfClass:
+      case KindOfMulti:
         break;
     }
     not_reached();
@@ -731,6 +735,11 @@ struct Variant : private TypedValue {
   ObjectData *getObjectData() const {
     assert(is(KindOfObject));
     return m_type == KindOfRef ? m_data.pref->var()->m_data.pobj : m_data.pobj;
+  }
+  // cheng-hack:
+  MultiVal* getMultiVal() const {
+    assert(is(KindOfObject));
+    return m_type == KindOfRef ? m_data.pref->var()->m_data.pmulti : m_data.pmulti;
   }
   ObjectData *getObjectDataOrNull() const {
     // This is a necessary evil because getObjectData() returns
@@ -1005,6 +1014,7 @@ public:
   Object toObject() const { return m_var.toObject(); }
   Resource toResource() const { return m_var.toResource(); }
   ObjectData *getObjectData() const { return m_var.getObjectData(); }
+  MultiVal *getMultiVal() const { return m_var.getMultiVal(); }
 
   bool isArray() const { return m_var.isArray(); }
   ArrNR toArrNR() const { return m_var.toArrNR(); }
@@ -1101,6 +1111,7 @@ private:
         assert(check_refcount(m_data.pres->getCount()));
         return;
       case KindOfRef:
+      case KindOfMulti:
       case KindOfClass:
         break;
     }

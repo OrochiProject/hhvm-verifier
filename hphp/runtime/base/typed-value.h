@@ -34,6 +34,7 @@ struct ObjectData;
 struct RefData;
 struct ResourceData;
 struct TypedValue;
+class  MultiVal;
 
 //////////////////////////////////////////////////////////////////////
 
@@ -51,6 +52,7 @@ union Value {
   ResourceData* pres;   // KindOfResource
   Class*        pcls;   // only in vm stack, no type tag.
   RefData*      pref;   // KindOfRef
+  MultiVal*  pmulti; // KindOfMulti
 };
 
 enum VarNrFlag { NR_FLAG = 1<<29 };
@@ -87,6 +89,8 @@ union AuxUnion {
 struct TypedValue {
   Value m_data;
   DataType m_type;
+  // stale field, moved to MultiVal, because of conflict with Ref
+  //DataType m_multi_type; // valid when this is a multi-value
   AuxUnion m_aux;
 
   std::string pretty() const; // debug formatting. see trace.h

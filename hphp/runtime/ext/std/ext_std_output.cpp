@@ -44,11 +44,12 @@ const int64_t k_PHP_OUTPUT_HANDLER_STDFLAGS =
   k_PHP_OUTPUT_HANDLER_CLEANABLE | k_PHP_OUTPUT_HANDLER_FLUSHABLE |
   k_PHP_OUTPUT_HANDLER_REMOVABLE;
 
+extern thread_local int batch_size;
+extern thread_local bool php_code_running;
 bool HHVM_FUNCTION(ob_start, const Variant& callback /* = null */,
                              int chunk_size /* = 0 */,
                              int flags /* = k_PHP_OUTPUT_HANDLER_STDFLAGS */) {
   // ignoring flags for now
-
   if (!callback.isNull()) {
     CallCtx ctx;
     vm_decode_function(callback, nullptr, false, ctx);
@@ -56,58 +57,199 @@ bool HHVM_FUNCTION(ob_start, const Variant& callback /* = null */,
       return false;
     }
   }
+
+  // cheng-hack:
+  if (batch_size > 1) {
+    cheng_assert(php_code_running);
+    g_context->m_isMultiObs = true;
+    g_context->multiObStart(callback, chunk_size);
+  } else {
+    // normal case
   g_context->obStart(callback, chunk_size);
+  }
   return true;
 }
+
 void HHVM_FUNCTION(ob_clean) {
+  // cheng-hack:
+  if (batch_size > 1) {
+    cheng_assert(php_code_running);
+    cheng_assert(g_context->m_isMultiObs);
+    g_context->multiObClean(k_PHP_OUTPUT_HANDLER_START | k_PHP_OUTPUT_HANDLER_CLEAN);
+  } else {
+    // normal case
   // PHP_OUTPUT_HANDLER_START is included by PHP5
   g_context->obClean(k_PHP_OUTPUT_HANDLER_START | k_PHP_OUTPUT_HANDLER_CLEAN);
+  }
 }
 void HHVM_FUNCTION(ob_flush) {
+  // cheng-hack:
+  if (batch_size > 1) {
+    cheng_assert(php_code_running);
+    cheng_assert(g_context->m_isMultiObs);
+    g_context->multiObFlush();
+  } else {
+    // normal case
   g_context->obFlush();
+  }
 }
 bool HHVM_FUNCTION(ob_end_clean) {
+  // cheng-hack:
+  if (batch_size > 1) {
+    cheng_assert(php_code_running);
+    cheng_assert(g_context->m_isMultiObs);
+    g_context->multiObClean(k_PHP_OUTPUT_HANDLER_START |
+                       k_PHP_OUTPUT_HANDLER_CLEAN |
+                       k_PHP_OUTPUT_HANDLER_END);
+    return g_context->multiObEnd();
+  } else {
+    // normal case:
   g_context->obClean(k_PHP_OUTPUT_HANDLER_START |
                      k_PHP_OUTPUT_HANDLER_CLEAN |
                      k_PHP_OUTPUT_HANDLER_END);
   return g_context->obEnd();
+  }
 }
 bool HHVM_FUNCTION(ob_end_flush) {
+  // cheng-hack:
+  if (batch_size > 1) {
+    cheng_assert(php_code_running);
+    cheng_assert(g_context->m_isMultiObs);
+    bool ret = g_context->multiObFlush();
+    g_context->multiObEnd();
+    return ret;
+  } else {
+    // normal case:
   bool ret = g_context->obFlush();
   g_context->obEnd();
   return ret;
+  }
 }
 void HHVM_FUNCTION(flush) {
+  // FIXME: will multi_obs confuse the flush?
   g_context->flush();
 }
 Variant HHVM_FUNCTION(ob_get_contents) {
+  if (batch_size > 1) {
+    cheng_assert(php_code_running);
+    cheng_assert(g_context->m_isMultiObs);
+    if (g_context->multiObGetLevel() == 0) return false;
+    std::vector<String> ret = g_context->multiObCopyContents();
+    TypedValue multi_ret = MultiVal::makeMultiVal();
+    for (auto str : ret) {
+      multi_ret.m_data.pmulti->addValue(Variant(str));
+    }
+
+    // check whether can shrink
+    auto single = multi_ret.m_data.pmulti->shrinkToSingle();
+    if (single != nullptr) {
+      return tvAsVariant(single);
+    } else {
+      return tvAsVariant(&multi_ret);
+    }
+  } else {
+    // normal case:
   if (HHVM_FN(ob_get_level)() == 0) {
     return false;
   }
   return g_context->obCopyContents();
+  }
 }
 Variant HHVM_FUNCTION(ob_get_clean) {
+  // cheng-hack:
+  if (batch_size > 1) {
+    cheng_assert(php_code_running);
+    cheng_assert(g_context->m_isMultiObs);
+    Variant output = HHVM_FN(ob_get_contents)();
+    if (!HHVM_FN(ob_end_clean)()) {
+      return false;
+    }
+    return output;
+  } else {
+    // normal case:
   String output = HHVM_FN(ob_get_contents)();
   if (!HHVM_FN(ob_end_clean)()) {
     return false;
   }
   return output;
+  }
 }
 Variant HHVM_FUNCTION(ob_get_flush) {
+  // cheng-hack:
+  if (batch_size > 1) {
+    cheng_assert(php_code_running);
+    cheng_assert(g_context->m_isMultiObs);
+    auto output = HHVM_FN(ob_get_contents)();
+    if (!HHVM_FN(ob_end_flush)()) {
+      return false;
+    }
+    return output;
+  } else {
   String output = g_context->obCopyContents();
   if (!HHVM_FN(ob_end_flush)()) {
     return false;
   }
   return output;
+  }
 }
-int64_t HHVM_FUNCTION(ob_get_length) {
+Variant HHVM_FUNCTION(ob_get_length) {
+  // cheng-hack:
+  if (batch_size > 1) {
+    cheng_assert(php_code_running);
+    cheng_assert(g_context->m_isMultiObs);
+    std::vector<int> lengthes = g_context->multiObGetContentLength();
+
+    TypedValue multi_ret = MultiVal::makeMultiVal();
+    for (auto len : lengthes) {
+      multi_ret.m_data.pmulti->addValue(Variant(len));
+    }
+
+    // check whether can shrink
+    auto single = multi_ret.m_data.pmulti->shrinkToSingle();
+    if (single != nullptr) {
+      return tvAsVariant(single);
+    } else {
+      return tvAsVariant(&multi_ret);
+    }
+  } else {
+    // normal case:
   return g_context->obGetContentLength();
+  }
 }
 int64_t HHVM_FUNCTION(ob_get_level) {
+  // cheng-hack:
+  if (batch_size > 1) {
+    cheng_assert(php_code_running);
+    // get level can happen outside of ob
+    return g_context->multiObGetLevel();
+  } else {
+    // normal case:
   return g_context->obGetLevel();
+  }
 }
-Array HHVM_FUNCTION(ob_get_status, bool full_status /* = false */) {
+Variant HHVM_FUNCTION(ob_get_status, bool full_status /* = false */) {
+  // cheng-hack:
+  if (batch_size > 1) {
+    cheng_assert(php_code_running);
+    cheng_assert(g_context->m_isMultiObs);
+    std::vector<Array> ret = g_context->multiObGetStatus(full_status);
+
+    TypedValue multi_ret = MultiVal::makeMultiVal();
+    for (auto it : ret) {
+      multi_ret.m_data.pmulti->addValue(Variant(it));
+    }
+    // check whehter can shrink
+    auto single = multi_ret.m_data.pmulti->shrinkToSingle();
+    if (single != nullptr) {
+      return tvAsVariant(single);
+    } else {
+      return tvAsVariant(&multi_ret);
+    }
+
+  } else {
+    // normal case:
   return g_context->obGetStatus(full_status);
+  }
 }
 void HHVM_FUNCTION(ob_implicit_flush, bool flag /* = true */) {
   g_context->obSetImplicitFlush(flag);

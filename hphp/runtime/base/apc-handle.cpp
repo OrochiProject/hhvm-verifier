@@ -107,6 +107,7 @@ StringCase:
       return APCArray::MakeShared();
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       return nullptr;
   }
@@ -134,6 +135,7 @@ Variant APCHandle::toLocal() const {
       return APCObject::MakeObject(this);
     case KindOfResource:
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -166,6 +168,7 @@ void APCHandle::deleteShared() {
 
     case KindOfResource:
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

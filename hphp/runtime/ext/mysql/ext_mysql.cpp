@@ -29,6 +29,13 @@
 #include "hphp/runtime/ext/mysql/mysql_stats.h"
 #include "hphp/system/systemlib.h"
 
+#include "hphp/runtime/ext/std/ext_std_variable.h"
+#include "vector"
+#include "algorithm"
+#include "runtime/ext/std/sql-parser.h"
+#include "hphp/runtime/vm/yastopwatch.h"
+#include "fstream"
+
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -679,11 +686,122 @@ static int64_t HHVM_FUNCTION(mysql_async_status,
 ///////////////////////////////////////////////////////////////////////////////
 // row operations
 
+
+// cheng-hack: because of query clustering, need to handle when resource has duplication
+static bool HHVM_FUNCTION(multi_mysql_data_seek, const Variant& var, const Variant& row) {
+  cheng_assert(row.m_type != KindOfMulti);
+  cheng_assert(var.m_type == KindOfMulti);
+
+  // FIXME: ugly copy/paste code
+  // compare whether the results are duplicated
+  std::set<ResourceData*> uniq_res;
+
+  int meet_non_res = -1; // -1: uninitialized, 0: no null_resource, 1: all null_resource
+  for (auto it : *var.m_data.pmulti) {
+    if (it->m_type != KindOfResource) {
+      cheng_assert(meet_non_res == 1 || meet_non_res == -1);
+      meet_non_res = 1;
+    } else {
+      cheng_assert(meet_non_res == 0 || meet_non_res == -1);
+      meet_non_res = 0; // I meet a good resource
+      uniq_res.insert(it->m_data.pres);
+    }
+  }
+
+  // handle non_res first and if so return
+  if (meet_non_res == 1) {
+    MySQLResult *res = php_mysql_extract_result(null_resource);
+    if (res == nullptr) return false;
+    return res->seekRow(row.asInt64Val());
+  }
+
+  // we do have some resources
+  TypedValue res_template;
+  res_template.m_type = KindOfResource;
+
+  bool is_first = true;
+  bool first_ret = true;
+  for (auto it : uniq_res) {
+    res_template.m_data.pres = it;
+    Resource result = tvAsVariant(&res_template).toResource();
+    MySQLResult *res = php_mysql_extract_result(result);
+
+    if (is_first) {
+      if (res == nullptr) {
+        first_ret = false;
+      } else {
+        first_ret = res->seekRow(row.asInt64Val());
+      }
+      is_first = false;
+    } else {
+      if (res == nullptr) {
+        cheng_assert(first_ret == false);
+      } else {
+        bool ret = res->seekRow(row.asInt64Val());
+        cheng_assert(ret == first_ret);
+      }
+    }
+  }
+  return first_ret; 
+}
+
 static bool HHVM_FUNCTION(mysql_data_seek, const Resource& result, int row) {
   MySQLResult *res = php_mysql_extract_result(result);
   if (res == nullptr) return false;
 
   return res->seekRow(row);
+}
+
+// cheng-hack: since query cluster, the multi-value resources can have duplicated ones 
+static Variant HHVM_FUNCTION(multi_mysql_fetch_array, const Variant& var,
+                                         const Variant& result_type /* = 3 */) {
+  cheng_assert(result_type.m_type != KindOfMulti);
+  cheng_assert(var.m_type == KindOfMulti);
+
+
+  // cheng-hack:
+  // db deduplication may generate an multivalue with many duplicated resources
+  // find the unique ones and add the seq_num to a map
+  TypedValue multi_ret = MultiVal::makeMultiVal();
+  std::map<void*, Variant> res2properties;
+
+  // check whether the resource is null_resource
+  int meet_non_res = -1; // -1: uninitialized, 0: no null_resource, 1: all null_resource
+  for (int i=0; i<var.m_data.pmulti->valSize(); i++) {
+    auto it = var.m_data.pmulti->getByVal(i);
+
+    if (it->m_type != KindOfResource) {
+      cheng_assert(meet_non_res == 1 || meet_non_res == -1);
+      meet_non_res = 1;
+    } else {
+      cheng_assert(meet_non_res == 0 || meet_non_res == -1);
+      meet_non_res = 0; // I meet a good resource
+
+      // collect the unique resource and their seq_num
+      void* ptr = (void*) it->m_data.pres;
+      if (res2properties.find(ptr) == res2properties.end()) {
+        // find a new Resource
+        auto var = tvAsVariant(it);
+        Resource result = var.isResource() ? var.toResource() : null_resource;
+        Variant properties = php_mysql_fetch_hash(result, result_type.asInt64Val());
+        res2properties[ptr] = properties;
+
+        multi_ret.m_data.pmulti->addValue(properties);
+      } else {
+        // find an existing resource
+        multi_ret.m_data.pmulti->addValue(res2properties[ptr]);
+      }
+    }
+  }
+
+  // if all are null_resource
+  if (meet_non_res == 1) {
+    return php_mysql_fetch_hash(null_resource, result_type.asInt64Val());
+  }
+
+  cheng_assert(meet_non_res == 0);
+  // construct the multivalue for properties
+  return tvAsVariant(&multi_ret);
 }
 
 static Variant HHVM_FUNCTION(mysql_fetch_array, const Resource& result,
@@ -721,6 +839,183 @@ static Variant HHVM_FUNCTION(mysql_fetch_object,
   }
 
   return false;
+}
+
+
+// cheng-hack: tmp debug
+static std::ofstream debug_db_log;
+static void
+writetolog(std::string msg) {
+  debug_db_log.open("/tmp/db_debug.log", std::ofstream::out | std::ofstream::app);
+  debug_db_log << msg << "\n";
+  debug_db_log.close();
+}
+
+
+
+// cheng-hack: used for do not call __set multiple times
+extern thread_local bool allow_mv_in_con;
+static Variant HHVM_FUNCTION(multi_mysql_fetch_object,
+                      const Variant& var_result,
+                      const String& class_name /* = "stdClass" */,
+                      const Variant& params /* = null */) {
+  bool var_multi = (var_result.m_type == KindOfMulti);
+  bool is_multi_param = (params.m_type == KindOfMulti);
+
+  if (!var_multi && !is_multi_param) {
+    return HHVM_FN(mysql_fetch_object)(var_result, class_name, params);
+  }
+
+//writetolog("------------fetch_object---------");
+//std::cout << "---------" << HHVM_FN(print_r)(var_result, true).toString().toCppString() << "\n";
+//std::cout << "------------end_fetch_object---------\n";
+
+  int size;
+  if (var_multi) {
+    size = var_result.m_data.pmulti->valSize();
+  } else if (is_multi_param) {
+    size = params.m_data.pmulti->valSize();
+  } else {
+    cheng_assert(false);
+  }
+
+  if (var_multi) {
+    cheng_assert(var_result.m_data.pmulti->getType() == KindOfResource);
+  } else {
+    cheng_assert(var_result.m_type == KindOfResource);
+  }
+
+  if (is_multi_param) {
+    cheng_assert(params.m_data.pmulti->valSize() == size);
+    cheng_assert(params.m_data.pmulti->getType() == KindOfArray);
+  }
+
+  sptr< std::vector<ObjectData*> > obj_arr = 
+               std::make_shared< std::vector<ObjectData*> >();
+
+  // if the var_result is multi:
+  if (var_multi) {
+
+  // cheng-hack:
+  // db deduplication may generate an multivalue with many duplicated resources
+  // find the unique ones and add the seq_num to a map
+
+  std::vector<Variant> properties_list;
+  std::map<void*, Variant> res2properties;
+  for (int i=0; i<size; i++) {
+    auto it = var_result.m_data.pmulti->getByVal(i);
+
+    // find the ptr
+    void* ptr = (void*) 0;
+    if (it->m_type == KindOfResource) {
+      ptr = (void*) it->m_data.pres;
+    } else {
+      std::cout << "The multival is not a rsource, we don't have a ptr \n";
+      cheng_assert(false);
+    }
+
+    if (res2properties.find(ptr) == res2properties.end()) {
+      // find a new Resource
+      auto var = tvAsVariant(it);
+      Resource result = var.isResource() ? var.toResource() // var.toResource() may consume the resource?
+                        : null_resource;
+      Variant properties = php_mysql_fetch_hash(result, PHP_MYSQL_ASSOC);
+      res2properties[ptr] = properties;
+
+      if (same(properties, false)) {
+        return false;
+      }
+
+      properties_list.push_back(properties);
+    } else {
+      // find an existing resource
+      properties_list.push_back(res2properties[ptr]);
+    }
+  }
+
+  for (int i=0; i< size; i++) {
+    // cheng-hack: original logic to fetch result from Resource
+    // however, because of the db dedup, there might be duplicated resources
+    // so we move the php_mysql_fetch_hash() ahead
+/*
+    auto it = var_result.m_data.pmulti->getByVal(i);
+    auto var = tvAsVariant(it);
+
+    Resource result = var.isResource() ? var.toResource()
+      : null_resource;
+    Variant properties = php_mysql_fetch_hash(result, PHP_MYSQL_ASSOC);
+    if (same(properties, false)) {
+      return false;
+    }
+*/
+    // cheng-hack: next line replace the above chunk
+    Variant properties = properties_list[i]; 
+
+    Object obj;
+
+    // We need to create an object without initialization (constructor call),
+    // and set the fetched fields as dynamic properties on the object prior
+    // calling the constructor.
+    obj = create_object_only(class_name);
+
+    // Set the fields.
+    obj->o_setArray(properties.toArray());
+
+    // collect the obj
+    obj_arr->push_back(obj.get());
+    obj->incRefCount();
+  }
+  } else {
+    cheng_assert(is_multi_param);
+
+    Resource result = var_result.isResource() ? var_result.toResource()
+      : null_resource;
+    Variant properties = php_mysql_fetch_hash(result, PHP_MYSQL_ASSOC);
+
+    if (same(properties, false)) {
+      return false;
+    }
+
+
+    // loop here
+    for (int i=0; i< size; i++) {
+      Object obj = create_object_only(class_name);
+      obj->o_setArray(properties.toArray());
+      obj_arr->push_back(obj.get());
+      obj->incRefCount();
+    }
+  }
+
+  //for(auto it: *obj_arr) {
+  //  auto txt = HHVM_FN(print_r)(Variant(it), true);
+  //  std::cout << txt.toString().toCppString() << "\n";
+  //}
+
+  Array paramsArray;
+  TypedValue multi_arr_list;
+  if (!is_multi_param) {
+    paramsArray = params.isArray()
+      ? params.asCArrRef()
+      : Array();
+  } else {
+    multi_arr_list = MultiVal::invertTransferArray(params);
+    paramsArray = tvAsVariant(&multi_arr_list).asCArrRef();
+  }
+
+  // And finally initialize the object by calling the constructor.
+  //auto obj = init_object(class_name, paramsArray, obj.get());
+  auto obj_new_arr = init_object_multi(class_name, paramsArray, obj_arr);
+  auto multi_obj = genMultiVal(obj_new_arr);
+
+  // free unused
+  tvRefcountedDecRef(&multi_arr_list);
+  for (auto it : *obj_new_arr) {
+    it->decRefCount();
+  }
+
+  //HHVM_FN(print_r)(Variant(obj));
+
+  return tvAsVariant(&multi_obj); 
 }
 
 Variant HHVM_FUNCTION(mysql_fetch_lengths, const Resource& result) {
@@ -865,6 +1160,79 @@ Variant HHVM_FUNCTION(mysql_num_rows, const Resource& result) {
   return false;
 }
 
+
+// cheng-hack: because of query clustering
+static bool HHVM_FUNCTION(multi_mysql_free_result, const Variant& var) {
+  bool multiresult = (var.m_type == KindOfMulti);
+
+  if (multiresult) {
+    // compare whether the results are duplicated
+    std::set<ResourceData*> uniq_res;
+
+    int meet_non_res = -1; // -1: uninitialized, 0: no null_resource, 1: all null_resource
+    for (auto it : *var.m_data.pmulti) {
+      if (it->m_type != KindOfResource) {
+        cheng_assert(meet_non_res == 1 || meet_non_res == -1);
+        meet_non_res = 1;
+      } else {
+        cheng_assert(meet_non_res == 0 || meet_non_res == -1);
+        meet_non_res = 0; // I meet a good resource
+        uniq_res.insert(it->m_data.pres);
+      }
+    }
+
+    // handle non_res first and if so return
+    if (meet_non_res == 1) {
+      MySQLResult *res = php_mysql_extract_result(null_resource);
+      if (res) {
+        res->close();
+        return true;
+      }
+      return false;
+    }
+
+    // we do have some resources
+    TypedValue res_template;
+    res_template.m_type = KindOfResource;
+
+    bool is_first = true;
+    bool first_ret = true;
+    for (auto it : uniq_res) {
+      res_template.m_data.pres = it;
+      Resource result = tvAsVariant(&res_template).toResource();
+      MySQLResult *res = php_mysql_extract_result(result);
+
+      if (is_first) {
+        if (res) {
+          res->close();
+          first_ret = true;
+        } else {
+          first_ret = false;
+        }
+        is_first = false;
+      } else {
+        if (res) {
+          res->close();
+          cheng_assert(first_ret == true);
+        } else {
+          cheng_assert(first_ret == false);
+        }
+      }
+    }
+    return first_ret;
+  } else {
+    Resource result = var.isResource() ? var.toResource() : null_resource;
+    // from orignal mysql_free_result:
+    MySQLResult *res = php_mysql_extract_result(result);
+    if (res) {
+      res->close();
+      return true;
+    }
+    return false;
+  }
+}
+
+
 static bool HHVM_FUNCTION(mysql_free_result, const Resource& result) {
   MySQLResult *res = php_mysql_extract_result(result);
   if (res) {
@@ -874,6 +1242,471 @@ static bool HHVM_FUNCTION(mysql_free_result, const Resource& result) {
   return false;
 }
 
+/**
+ * cheng: Borrow from member-operations.h
+ * SetNewElem when base is an Array
+ */
+static inline ArrayData* SetNewElemArray(ArrayData* a, TypedValue* value) {
+  //ArrayData* a = base->m_data.parr;
+  bool copy = (a->hasMultipleRefs())
+    || (value->m_type == KindOfArray && value->m_data.parr == a);
+  ArrayData* a2 = a->append(cellAsCVarRef(*value), copy);
+  if (a2 != a) {
+    a2->incRefCount();
+    a->decRefAndRelease();
+  }
+  return a2;
+}
+
+/**
+ * cheng-hack: Borrow from member-operations.h
+ * SetElem helper with Array base and Int64 key
+ */
+static inline ArrayData*
+SetElemArrayPre_keyint(ArrayData* a,
+                                  int64_t key,
+                                  Cell* value,
+                                  bool copy) {
+  return a->set(key, cellAsCVarRef(*value), copy);
+}
+
+/**
+ * cheng-hack: Borrow from member-operations.h
+ * SetElem when base is an Array
+ */
+static inline ArrayData*
+SetElemArray(ArrayData* a, int64_t key,
+                         Cell* value) {
+  //ArrayData* a = base->m_data.parr;
+  bool copy = (a->hasMultipleRefs())
+    || (value->m_type == KindOfArray && value->m_data.parr == a);
+
+  auto* newData = SetElemArrayPre_keyint(a, key, value, copy);
+
+  //arrayRefShuffle<true>(a, newData, base);
+  // cheng-hack: following is the translate of above
+  if (newData != a) {
+    newData->incRefCount();
+    a->decRefAndRelease();
+  }
+  return newData;
+}
+
+// defined in bytecode.cpp
+#define MAX_IN_TXN 10000
+extern int search_opmap(int rid, int opnum, int type);
+
+static std::vector<int64_t>
+genQueryTimeStamp(const Variant& req_no, int64_t opnum, int64_t query_num) {
+  std::vector<int64_t> tss;
+  // single req_no
+  if (req_no.m_type == KindOfInt64) {
+    // get timestamp from (rid, opnum) pair
+    int rid = req_no.m_data.num;
+    // both read and write can be here!
+    int64_t seq_num = search_opmap(rid, opnum, TYPE_NONE);
+    int64_t ts = seq_num * MAX_IN_TXN + query_num;
+    tss.push_back(ts);
+  } else if (req_no.m_type == KindOfMulti) {
+    cheng_assert(req_no.m_data.pmulti->getType() == KindOfInt64);
+
+    // get timestamp from multiple (rid, opnum) pairs
+    for (auto it : *req_no.m_data.pmulti) {
+      int rid = it->m_data.num;
+      int64_t seq_num = search_opmap(rid, opnum, TYPE_NONE);
+      int64_t ts = seq_num * MAX_IN_TXN + query_num;
+      tss.push_back(ts);
+    }
+  } else {
+    // should never be here
+    cheng_assert(false);
+  }
+  return tss;
+}
+
+static inline bool
+checkQuerySelect(const Variant& query) {
+  if (query.m_type != KindOfMulti) {
+    auto str = (query.toString().toCppString()).substr(0,6);
+    std::transform(str.begin(), str.end(), str.begin(), ::tolower);
+    if (str == "select") {
+      return true;
+    }
+    return false;
+  } else {
+    int ret_true = -1;
+    for (auto it : *query.m_data.pmulti) {
+      auto str = (tvAsVariant(it).toString().toCppString()).substr(0,6);
+      std::transform(str.begin(), str.end(), str.begin(), ::tolower);
+      if (ret_true == -1) {
+        ret_true = (str == "select");
+      } else {
+        cheng_assert(ret_true == (str == "select"));
+      }
+    }
+    return ret_true;
+  }
+}
+
+static inline bool
+checkQueryShow(const Variant& query) {
+  if (query.m_type != KindOfMulti) {
+    auto str = (query.toString().toCppString()).substr(0,4);
+    std::transform(str.begin(), str.end(), str.begin(), ::tolower);
+    return (str == "show");
+  } else {
+    auto str = (tvAsVariant(query.m_data.pmulti->getByVal(0)).toString().toCppString()).substr(0,4);
+    std::transform(str.begin(), str.end(), str.begin(), ::tolower);
+    return (str == "show");
+  }
+}
+
+extern Variant HHVM_METHOD(mysqli, hh_get_connection, int64_t state);
+extern Variant HHVM_METHOD(mysqli, hh_get_result, bool use_store);
+extern Variant HHVM_METHOD(mysqli, hh_real_query, const String& query);
+
+
+//------------------------------
+//--------cheng-hack------------
+//------------------------------
+
+uint64_t search_table_update_log (std::string tname, uint64_t cur_ts);
+static inline bool
+noTableUpdate(std::vector<std::string> tnames, std::vector<int64_t> tss) {
+  bool run_once = true;
+  for (auto name : tnames) {
+    bool first = true;
+    uint64_t last_ts = 0;
+    for (auto cur_ts : tss) {
+      auto tmp_last = search_table_update_log(name, cur_ts);
+      if (first) {
+        first = false;
+        last_ts = tmp_last;
+      } else {
+        run_once = (last_ts == tmp_last);
+      }
+//if (!run_once) std::cout << "    fail on dedup, table[" << name << "], cur_ts=" << cur_ts 
+//<< ", other_last=" << last_ts << ", cur_last=" << tmp_last << "\n";
+      if (!run_once) break;
+    }
+    if (!run_once) break;
+  }
+  return run_once;
+}
+
+// we have to guarantee that this returned string
+// includes all the last modification time for all the tables
+static inline std::string 
+lastModifiedTssStr(std::vector<std::string> tnames, int64_t cur_ts) {
+  std::string last_tss_str;
+  for (auto name : tnames) {
+    auto tmp_last = search_table_update_log(name, cur_ts);
+    // find the oldest modification timestamp
+    last_tss_str += std::to_string(tmp_last)+"-";
+  }
+  return last_tss_str;
+}
+
+// cheng-hack:
+// Inputs:
+//   query: can be either single-string or multi-value string
+//   req_no: can be either one int or multi-value int
+//   mysqli_obj: is $this in mysqli
+// Output:
+//     an array of query results, should use "new mysql_result($result, MYSQLI_STORE_RESULT)"
+//     to construct the return value of mysqli->query().
+
+extern bool table_update_log_loaded;
+// NOTE: ASSUMPTION: the resultmode == MYSQLI_STORE_RESULT
+//static Variant HHVM_FUNCTION(ttdb_query, const Variant& query, const Variant& req_no,
+//                             const int64_t op_num, const int64_t query_num, const Variant& mysqli_obj) {
+
+// stop watch for db query
+extern struct __stopwatch__ __SW(db_dedup_time);
+extern enum __stopwatch__source__ __SOURCE(db_dedup_time); 
+extern enum __stopwatch__type__ __TYPE(db_dedup_time);
+
+extern struct __stopwatch__ __SW(db_trans_time);
+extern enum __stopwatch__source__ __SOURCE(db_trans_time); 
+extern enum __stopwatch__type__ __TYPE(db_trans_time);
+
+
+// cheng-hack: this is an optimization for tracing table name
+// query => table_name vector
+std::map<std::string, std::vector<std::string> >  table_name_cache;
+
+static inline std::vector<std::string>
+get_table_names_from_cache(std::string sql) {
+  if (table_name_cache.find(sql) == table_name_cache.end()) {
+    table_name_cache[sql] = extractTableNames(sql);
+  }
+  return table_name_cache[sql];
+}
+
+
+// NOTE: ASSUMPTION: the resultmode == MYSQLI_STORE_RESULT
+static Variant HHVM_FUNCTION(ttdb_query, const Variant& query, const Variant& req_no,
+                             const int64_t op_num, const int64_t query_num, const Variant& mysqli_obj) {
+//static Variant xxx_ttdb_query (const Variant& query, const Variant& req_no,
+//                             const int64_t op_num, const int64_t query_num, const Variant& mysqli_obj) {
+  // (1) genQueryTimeStamp
+  // (2) if query is update, just return
+  // (3) rewrite the select query
+  // (4) do real query
+  // (5) collect result and return
+  cheng_assert(table_update_log_loaded); // we only support this now
+  auto tss = genQueryTimeStamp(req_no, op_num, query_num);
+  bool is_read = checkQuerySelect(query);
+
+  {
+    // dump the other query to file
+    std::ofstream of("/tmp/veri/sql-verify-2.log", std::ofstream::app);
+    int size = tss.size();
+    for (int i=0 ; i<size; i++) {
+      std::string str_q;
+      if (query.m_type == KindOfMulti) {
+        str_q = tvAsVariant(query.m_data.pmulti->getByVal(i)).toString().toCppString();
+      } else {
+        str_q = query.toString().toCppString();
+      }
+      of << tss[i] << "#&#" << str_q << "|]|";
+    }
+    of.close();
+  }
+
+  bool is_show = checkQueryShow(query);
+  cheng_assert(!is_show);
+
+  // (2) check if select
+  if (!is_read) {
+    // FIXME: failure handling needed
+    return true;
+  }
+
+  // (3) rewrite the select query 
+  bool is_multi_req = (req_no.m_type == KindOfMulti);
+  // query_cluster[sql][ts] => [seqnum1, seqnum2...]
+  std::map<std::string, std::map<std::string, std::vector<int> > > query_cluster;
+
+  //START_SW(db_dedup_time);
+  if (UNLIKELY(!is_multi_req)) {
+    // this is single request,
+    // query_cluster will be [query][ts]=>[0]
+    cheng_assert(tss.size() == 1);
+    auto q_str = query.toString().toCppString();
+    query_cluster[q_str] = std::map<std::string, std::vector<int> >();
+    query_cluster[q_str]["single"] = std::vector<int>();
+    query_cluster[q_str]["single"].push_back(0);
+  } else {
+    cheng_assert(is_multi_req);
+    bool is_multi_query = (query.m_type == KindOfMulti);
+
+    for (int i=0; i<tss.size(); i++) {
+      auto cur_q = (is_multi_query
+                    ? tvAsVariant(query.m_data.pmulti->getByVal(i)).toString().toCppString()
+                    : query.toString().toCppString());
+
+      // fit this query into query_cluster[cur_q][last_modified_tss_str]
+      auto table_names = get_table_names_from_cache(cur_q); // FIXME: here might be a lot of redundency
+      auto last_m_tss_str = lastModifiedTssStr(table_names, tss[i]);
+
+      if (query_cluster.find(cur_q) == query_cluster.end()) {
+        // new query
+        query_cluster[cur_q] = std::map<std::string, std::vector<int> >();
+      }
+      if (query_cluster[cur_q].find(last_m_tss_str) == query_cluster[cur_q].end()) {
+        // new ts
+        query_cluster[cur_q][last_m_tss_str] = std::vector<int>();
+      }
+      query_cluster[cur_q][last_m_tss_str].push_back(i);
+    }
+  }
+  // in below, all the queries belong to one query_cluster[query][last_tss_str] can be dedup
+  //STOP_SW(db_dedup_time);
+
+  // (4) do query & collect results
+  ArrayData* ret_array = staticEmptyArray();
+  bool ret_bool = false;
+  // -1: uninitialized
+  // 0: get null
+  // 1: get 2
+  // 2: get others
+  int has_ret = -1;
+
+  // we need:
+  //  -- query_cluster (with sql as key, and ts_map as value)
+  //  -- tss [timestamp for each query, same seqnum in query_cluster) 
+  for (auto it : query_cluster) {
+    auto orig_sql = it.first;
+    auto ts_map = it.second;
+
+    for (auto ts_it : ts_map) {
+      // current queries should have (1) same query and (2) same last_ts, can be dedup
+      auto seq_vec = ts_it.second;
+      auto first_ts = tss[seq_vec[0]]; // get the ts from first sql
+      START_SW(db_trans_time);
+      auto tt_sql = rewriteOptSelect(orig_sql, first_ts);
+      STOP_SW(db_trans_time);
+      // do once for all
+      auto q_rst = HHVM_MN(mysqli, hh_real_query)(mysqli_obj.m_data.pobj, Variant(tt_sql).toString());
+
+      if (has_ret == -1) {
+        if (q_rst.m_type == KindOfInt64 && q_rst.m_data.num == 2) {
+          has_ret = 1;
+        } else if (q_rst.m_type == KindOfNull) {
+          has_ret = 0;
+        } else if (q_rst.m_type == KindOfInt64) {
+          has_ret = 2;
+          ret_bool = (q_rst.m_data.num != 0);
+        } else {
+          // shouldn't be other value!
+          cheng_assert(false);
+        }
+      }
+      if (has_ret == 1) {
+        cheng_assert(q_rst.m_data.num == 2);
+        auto result = HHVM_MN(mysqli, hh_get_result)(mysqli_obj.m_data.pobj, true);
+        // all the query in this query cluster should have the same value
+        // but this is resource!!!!
+        for (auto seqnum : seq_vec) {
+          ret_array = SetElemArray(ret_array, seqnum, result.asTypedValue());
+        }
+        cheng_assert(result.m_type == KindOfResource);
+      } else if (has_ret == 2) {
+        cheng_assert( (q_rst.m_data.num !=0 ) == ret_bool);
+      } else {
+        cheng_assert(q_rst.m_type == KindOfNull);
+      }
+
+    } // end iter of ts_map
+  } // end iter of query_cluster
+
+  if (has_ret == 0) {
+    return init_null();
+  } else if (has_ret == 1) {
+    return ret_array;
+  } else if (has_ret == 2) {
+    return ret_bool;
+  } else {
+    cheng_assert(false);
+    return 0;
+  }
+}
+
+
+static Variant HHVM_FUNCTION(ttdb_query_mysqli_result, const Variant& query, const Variant& req_no,
+                             const int64_t op_num, const int64_t query_number, const Variant& mysqli_obj) {
+  START_SW(db_dedup_time);
+  auto ret_arr = HHVM_FN(ttdb_query)(query, req_no, op_num, query_number, mysqli_obj);
+  if (is_bool(ret_arr)) {
+    STOP_SW(db_dedup_time);
+    return ret_arr;
+  }
+  cheng_assert(is_array(ret_arr));
+  int size = ret_arr.asCArrRef().size();
+  cheng_assert(size > 0);
+
+  if (size == 1) {
+    // only one result
+    auto obj = create_object_only("mysqli_result");
+    // The argument of the mysqli_result is "a resource" from "hh_get_result"
+    // we accidentally can use the return array for this purpose
+    const auto paramsArray = ret_arr.asCArrRef(); 
+    obj = init_object("mysqli_result", paramsArray, obj.get());
+    STOP_SW(db_dedup_time);
+    return obj;
+  } else {
+    // create multiple obj
+    sptr< std::vector<ObjectData*> > obj_arr = 
+      std::make_shared< std::vector<ObjectData*> >();
+    for (int i = 0; i < size; i++) {
+      auto obj = create_object_only("mysqli_result");
+      obj->incRefCount();
+      obj_arr->push_back(obj.get());
+    }
+    // construct the parameter list
+    TypedValue multi_arg = MultiVal::makeMultiVal();
+    for (int i = 0; i < size; i++) {
+      multi_arg.m_data.pmulti->addValueNoInc(ret_arr.asArrRef()[i]);
+    }
+    ArrayData* params = staticEmptyArray();
+    params = SetNewElemArray(params, &multi_arg);
+    const auto paramsArray = Variant(params).asCArrRef();
+
+    // call constructor in one turn
+    auto obj_new_arr = init_object_multi("mysqli_result", paramsArray, obj_arr);
+    auto multi_obj = genMultiVal(obj_new_arr);
+
+    // free unused
+    for (auto it : *obj_new_arr) {
+      it->decRefCount();
+    }
+    STOP_SW(db_dedup_time);
+    return tvAsVariant(&multi_obj);
+  }
+}
+
+// cheng-hack:
+// Inputs:
+//     query: should be either multi-value string or single string as sql query
+//     tss:   multi-value int as timestamp for rewriting
+//     mysqli_obj: the object of mysqli, used as $this
+// Output:
+//     an array of query results, should use "new mysql_result($result, MYSQLI_STORE_RESULT)"
+//     to construct the return value of mysqli->query().
+
+static Variant HHVM_FUNCTION(ttdb_multi_query, const Variant& query, const Variant& req_no,
+                             const int64_t op_num, const int64_t query_number, const Variant& mysqli_obj) {
+  always_assert(query.m_type == KindOfMulti 
+    || query.m_type == KindOfStaticString || query.m_type == KindOfString);
+  always_assert(req_no.m_type == KindOfMulti);
+  always_assert(mysqli_obj.m_type == KindOfObject);
+
+  if (!checkQuerySelect(query)) {
+    return true;
+  }
+  
+  // do the multi_query, and then return myqli_result as multi_val
+  bool multi_q = (query.m_type == KindOfMulti);
+  if (multi_q) {
+    cheng_assert(query.m_data.pmulti->valSize()
+                  == req_no.m_data.pmulti->valSize());
+  }
+
+  // construct new query
+  std::stringstream ss;
+  //ss << "START TRANSACTION;";
+  int size = 1;
+  if (multi_q) {
+    size = query.m_data.pmulti->valSize();
+  }
+
+  for (int i = 0; i < size; i++) {
+    const Variant curq = (multi_q ? tvAsVariant(query.m_data.pmulti->getByVal(i)) : query);
+    int64_t rid = (multi_q ? tvAsVariant(req_no.m_data.pmulti->getByVal(i)).asInt64Val() : req_no.asInt64Val());
+    auto ttq = HHVM_FN(rewrite_select_sql)(curq, rid , op_num, query_number);
+    cheng_assert(ttq.m_type == KindOfString);
+    ss << ttq.toString().toCppString() << ";";
+  }
+  //ss << "COMMIT;";
+
+  // do multi_query
+  auto link = HHVM_MN(mysqli, hh_get_connection)(mysqli_obj.m_data.pobj, 2);
+  auto ret = HHVM_FN(mysql_multi_query)(ss.str(), link);
+  cheng_assert(ret.m_type == KindOfBoolean && ret.m_data.num != 0);
+
+  // get result and generate multi-value
+  ArrayData* ret_array = staticEmptyArray();
+  bool next = false;
+  do {
+    auto result = HHVM_MN(mysqli, hh_get_result)(mysqli_obj.m_data.pobj, true);
+    ret_array = SetNewElemArray(ret_array, result.asTypedValue());
+    cheng_assert(result.m_type == KindOfResource);
+    next = ! HHVM_FN(mysql_next_result)(link);
+  } while(next);
+
+  return ret_array;
+}
 ///////////////////////////////////////////////////////////////////////////////
 // field info
 
@@ -903,6 +1736,109 @@ static Variant HHVM_FUNCTION(mysql_fetch_field, const Resource& result,
   obj->o_set("unsigned",     info->flags & UNSIGNED_FLAG? 1 : 0);
   obj->o_set("zerofill",     info->flags & ZEROFILL_FLAG? 1 : 0);
   return obj;
+}
+
+
+// cheng-hack: due to query clustering, resources may duplicate
+static Variant HHVM_FUNCTION(multi_mysql_fetch_field, const Variant& var,
+                                         const Variant& field /* = -1 */) {
+  cheng_assert(var.m_type == KindOfMulti);
+  cheng_assert(field.m_type != KindOfMulti);
+
+  // check the uniq resources and reserve the seq_num
+  // FIXME: ugly copy paste code
+  TypedValue multi_ret = MultiVal::makeMultiVal();
+  std::map<void*, Variant> res2properties;
+
+  for (int i=0; i<var.m_data.pmulti->valSize(); i++) {
+    auto it = var.m_data.pmulti->getByVal(i);
+
+    // find the ptr
+    void* ptr = (void*) 0;
+    if (it->m_type == KindOfResource) {
+      ptr = (void*) it->m_data.pres;
+    } else {
+      std::cout << "The multival is not a rsource, we don't have a ptr \n";
+      cheng_assert(false);
+    }
+
+    if (res2properties.find(ptr) == res2properties.end()) {
+      // find a new Resource
+      auto var = tvAsVariant(it);
+      Resource result = var.isResource() ? var.toResource() : null_resource;
+      auto obj = HHVM_FN(mysql_fetch_field)(result, field.asInt64Val());
+      // put it into the map
+      res2properties[ptr] = obj;
+      // add it to the multi_ret
+      // FIXME: doe we need clone??
+      multi_ret.m_data.pmulti->addValue(obj);
+    } else {
+      // find an existing resource
+      multi_ret.m_data.pmulti->addValue(res2properties[ptr]);
+    }
+  }
+
+  return tvAsVariant(&multi_ret);
+}
+
+
+
+// cheng-hack: query clustering may make the resource duplicated
+static bool HHVM_FUNCTION(multi_mysql_field_seek, const Variant& var, const Variant& field) {
+  cheng_assert(var.m_type == KindOfMulti);
+  cheng_assert(field.m_type != KindOfMulti);
+
+  // FIXME: ugly copy/paste code
+  // compare whether the results are duplicated
+  std::set<ResourceData*> uniq_res;
+
+  int meet_non_res = -1; // -1: uninitialized, 0: no null_resource, 1: all null_resource
+  for (auto it : *var.m_data.pmulti) {
+    if (it->m_type != KindOfResource) {
+      cheng_assert(meet_non_res == 1 || meet_non_res == -1);
+      meet_non_res = 1;
+    } else {
+      cheng_assert(meet_non_res == 0 || meet_non_res == -1);
+      meet_non_res = 0; // I meet a good resource
+      uniq_res.insert(it->m_data.pres);
+    }
+  }
+
+  // handle non_res first and if so return
+  if (meet_non_res == 1) {
+    MySQLResult *res = php_mysql_extract_result(null_resource);
+    if (res == nullptr) return false;
+    return res->seekField(field.asInt64Val());
+  }
+
+  // we do have some resources
+  TypedValue res_template;
+  res_template.m_type = KindOfResource;
+
+  bool is_first = true;
+  bool first_ret = true;
+  for (auto it : uniq_res) {
+    res_template.m_data.pres = it;
+    Resource result = tvAsVariant(&res_template).toResource();
+    MySQLResult *res = php_mysql_extract_result(result);
+
+    if (is_first) {
+      if (res == nullptr) {
+        first_ret = false;
+      } else {
+        first_ret = res->seekField(field.asInt64Val());
+      }
+      is_first = false;
+    } else {
+      if (res == nullptr) {
+        cheng_assert(first_ret == false);
+      } else {
+        bool ret = res->seekRow(field.asInt64Val());
+        cheng_assert(ret == first_ret);
+      }
+    }
+  }
+  return first_ret; 
 }
 
 static bool HHVM_FUNCTION(mysql_field_seek, const Resource& result, int field) {
@@ -973,6 +1909,9 @@ void mysqlExtension::moduleInit() {
   HHVM_FE(mysql_affected_rows);
   HHVM_FE(mysql_query);
   HHVM_FE(mysql_multi_query);
+  HHVM_FE(ttdb_query); // cheng-hack
+  HHVM_FE(ttdb_query_mysqli_result); // cheng-hack
+  HHVM_FE(ttdb_multi_query); // cheng-hack
   HHVM_FE(mysql_next_result);
   HHVM_FE(mysql_more_results);
   HHVM_FE(mysql_fetch_result);
@@ -981,15 +1920,20 @@ void mysqlExtension::moduleInit() {
   HHVM_FE(mysql_list_tables);
   HHVM_FE(mysql_list_processes);
   HHVM_FE(mysql_data_seek);
+  HHVM_FE(multi_mysql_data_seek); //cheng-hack
   HHVM_FE(mysql_fetch_array);
+  HHVM_FE(multi_mysql_fetch_array); // cheng-hack
   HHVM_FE(mysql_fetch_object);
+  HHVM_FE(multi_mysql_fetch_object); // cheng-hack
   HHVM_FE(mysql_fetch_lengths);
   HHVM_FE(mysql_result);
   HHVM_FE(mysql_num_fields);
   HHVM_FE(mysql_num_rows);
   HHVM_FE(mysql_free_result);
+  HHVM_FE(multi_mysql_free_result); // cheng-hack
   HHVM_FE(mysql_fetch_field);
   HHVM_FE(mysql_field_seek);
+  HHVM_FE(multi_mysql_field_seek); // cheng-hack
   HHVM_FE(mysql_field_name);
   HHVM_FE(mysql_field_table);
   HHVM_FE(mysql_field_len);

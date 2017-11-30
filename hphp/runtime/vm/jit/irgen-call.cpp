@@ -505,7 +505,8 @@ void emitFPushCtor(HTS& env, int32_t numParams) {
   auto const obj  = gen(env, AllocObj, cls);
   gen(env, IncRef, obj);
   pushIncRef(env, obj);
-  auto numArgsAndFlags = ActRec::encodeNumArgs(numParams, false, false, true);
+  // cheng-hack:
+  auto numArgsAndFlags = ActRec::encodeNumArgs(numParams, false, false, true, false);
   fpushActRec(env, func, obj, numArgsAndFlags, nullptr);
 }
 
@@ -551,7 +552,8 @@ void emitFPushCtorD(HTS& env,
                              : gen(env, AllocObj, ssaCls);
   gen(env, IncRef, obj);
   pushIncRef(env, obj);
-  auto numArgsAndFlags = ActRec::encodeNumArgs(numParams, false, false, true);
+  // cheng-hack:
+  auto numArgsAndFlags = ActRec::encodeNumArgs(numParams, false, false, true, false);
   fpushActRec(env, ssaFunc, obj, numArgsAndFlags, nullptr);
 }
 

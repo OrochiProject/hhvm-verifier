@@ -164,6 +164,7 @@ static uint32_t memcache_get_flag_for_type(const Variant& var) {
     case KindOfRef:
       return MMC_TYPE_STRING;
 
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

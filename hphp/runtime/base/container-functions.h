@@ -26,7 +26,10 @@ namespace HPHP {
 inline bool isContainer(const Cell c) {
   assert(cellIsPlausible(c));
   return c.m_type == KindOfArray ||
-         (c.m_type == KindOfObject && c.m_data.pobj->isCollection());
+         (c.m_type == KindOfObject && c.m_data.pobj->isCollection()) ||
+         // cheng-hack: multi-val can be container
+         // FIXME: not include obj
+         (c.m_type == KindOfMulti && c.m_data.pmulti->getType() == KindOfArray);
 }
 
 inline bool isContainer(const Variant& v) {

@@ -84,7 +84,8 @@ String c_Generator::t_getcalledclass() {
   String called_class;
 
   if (actRec()->hasThis()) {
-    called_class = actRec()->getThis()->getVMClass()->name()->data();
+    // cheng-hack:
+    called_class = actRec()->getThisDefault()->getVMClass()->name()->data();
   } else if (actRec()->hasClass()) {
     called_class = actRec()->getClass()->name()->data();
   } else {
@@ -104,7 +105,13 @@ void c_Generator::copyVars(ActRec* srcFp) {
   }
 
   if (dstFp->hasThis()) {
-    dstFp->getThis()->incRefCount();
+    // cheng-hack:
+    if (dstFp->isMultiThis()) {
+      for (auto it : *dstFp->getThisMulti()) { it->incRefCount(); }
+    } else {
+      // normal case
+    dstFp->getThisSingle()->incRefCount();
+    }
   }
 
   if (LIKELY(srcFp->m_varEnv == nullptr)) {

@@ -148,7 +148,8 @@ function ob_get_flush(): mixed;
  * no buffering is active.
  */
 <<__Native>>
-function ob_get_length(): int;
+function ob_get_length(): mixed;
+//function ob_get_length(): int;
 
 /* Returns the nesting level of the output buffering mechanism.
  * @return int - Returns the level of nested output buffering handlers or zero
@@ -164,7 +165,8 @@ function ob_get_level(): int;
  * @return array
  */
 <<__Native>>
-function ob_get_status(bool $full_status = false): array;
+function ob_get_status(bool $full_status = false): mixed;
+//function ob_get_status(bool $full_status = false): array;
 
 /* ob_implicit_flush() will turn implicit flushing on or off. Implicit
  * flushing will result in a flush operation after every output call, so that

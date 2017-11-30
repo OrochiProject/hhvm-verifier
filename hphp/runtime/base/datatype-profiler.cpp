@@ -46,6 +46,7 @@ DataType DataTypeProfiler::operator()(DataType type) {
     case KindOfObject:        m_object.count(); break;
     case KindOfResource:      m_resource.count(); break;
     case KindOfRef:           m_ref.count(); break;
+    case KindOfMulti:         not_reached();
     case KindOfClass:         not_reached();
   }
   return type;

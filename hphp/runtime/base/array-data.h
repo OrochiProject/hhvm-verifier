@@ -58,6 +58,10 @@ struct ArrayData {
     kProxyKind = 9,   // ProxyArray
     kNumKinds = 10     // insert new values before kNumKinds.
   };
+  enum WithMulti: uint8_t {
+    arrayNormal = 0, // user defined arrays
+    arrayWithMulti = 7 // system arrays, like $_ENV, $_SERVER
+  };
 
 protected:
   /*
@@ -114,6 +118,18 @@ public:
    */
   ArrayKind kind() const {
     return m_kind;
+  }
+
+  // cheng-hack: m_with_multi handling
+  bool withMulti () const {
+    return (m_with_multi == arrayWithMulti);
+  }
+  void setWithMulti (bool with) {
+    if (with) {
+      m_with_multi = arrayWithMulti;
+    } else {
+      m_with_multi = arrayNormal;
+    }
   }
 
   /**
@@ -519,7 +535,12 @@ protected:
       union {
         struct {
           UNUSED uint16_t m_unused1;
-          UNUSED uint8_t m_unused0;
+          //UNUSED uint8_t m_unused0;
+          // cheng-hack: add MultiArray to distinguish whether 
+          //             CGetM a multivalue is valid or not
+          // NOTE: I would assume, the system array ($_SERVER) will not be 
+          //       copied, since if it is copied, we should propagate m_multi_arr flag
+          WithMulti m_with_multi;
           ArrayKind m_kind;
         };
         // Packed arrays overlay their encoded capacity with the kind field.

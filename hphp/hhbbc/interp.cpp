@@ -2125,6 +2125,12 @@ void in(ISS& env, const bc::Await&) {
   push(env, inner);
 }
 
+// cheng-hack: FIXME: is this right?
+void in(ISS& env, const bc::AddMulti&) {
+  popC(env); popC(env); popC(env);
+  push(env, TObj);
+}
+
 void in(ISS& env, const bc::Strlen&) {
   auto const t1 = popC(env);
   auto const v1 = tv(t1);

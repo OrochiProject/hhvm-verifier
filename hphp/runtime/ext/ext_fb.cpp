@@ -491,6 +491,7 @@ static int fb_compact_serialize_variant(StringBuffer& sb,
 
     case KindOfResource:
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

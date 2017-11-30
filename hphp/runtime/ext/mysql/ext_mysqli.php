@@ -1,8 +1,5 @@
 <?hh
 
-/**
- * Represents a connection between PHP and a MySQL database.
- */
 class mysqli {
 
   public static int $__connection_errno = 0;
@@ -556,13 +553,42 @@ class mysqli {
    *   mysqli_result object. For other successful queries mysqli_query()
    *   will return TRUE.
    */
-  public function query(string $query,
+
+  public static function fail($msg) {
+    echo "FATAL ERROR: during $msg\n";
+    debug_print_backtrace();
+    exit(1);
+  }
+
+
+  public function query(/*string*/mixed $query,
                         int $resultmode = MYSQLI_STORE_RESULT): ?mixed {
     if ($resultmode !== MYSQLI_STORE_RESULT &&
         $resultmode !== MYSQLI_USE_RESULT) {
       trigger_error("Invalid value for resultmode", E_WARNING);
       return false;
     }
+
+    // =================
+    // cheng-hack:
+    global $req_no;
+    if (!isset($req_no)) {
+      mysqli::fail( "no \$req_no during verification\n");
+    }
+    if ($resultmode != MYSQLI_STORE_RESULT) {
+      mysqli::fail("not support none-MYSQLI_STORE_RESULT\n");
+    }
+    /*
+    // check if this is from the oro_query, if not, stop
+    $trace = debug_backtrace();
+    if ($trace[1]["function"] != "oro_mysql_query") {
+      print_r($trace[1]);
+      debug_print_backtrace();
+      echo "ERROR! do query not from oro_mysql_query!";
+      exit(1);
+    }
+     */
+    // =================
 
     $result = $this->hh_real_query($query);
     if ($result === null) {
@@ -1038,6 +1064,7 @@ class mysqli_result {
    *
    * @return void -
    */
+  // cheng-hack: query cluster, done, in free()
   public function close(): void {
     $this->free();
   }
@@ -1058,7 +1085,13 @@ class mysqli_result {
       return false;
     }
 
+    // cheng-hack:
+    if (is_multi($this->__result)) {
+      return multi_mysql_data_seek($this->__result, $offset);
+    } else {
+    // original case
     return mysql_data_seek($this->__result, $offset);
+    }
   }
 
   /**
@@ -1098,12 +1131,35 @@ class mysqli_result {
    *   fetched row or NULL if there are no more rows in resultset.
    */
   public function fetch_array(int $resulttype = MYSQLI_BOTH): mixed {
+    // cheng-hack:
+    if (is_multi($this->__result)) {
+/*
+      $type = $this->__mysqli_to_mysql_resulttype($resulttype);
+      // XXX FIXME:
+      $row = mysql_fetch_array($this->__result, $type);
+      $multi_ret = $this->__checkRow($row);
+      // This can be costy
+      if (is_multi($multi_ret)) {
+        $multi_ret = merge_multi($multi_ret);
+      }
+      return $multi_ret;
+*/
+      $type = $this->__mysqli_to_mysql_resulttype($resulttype);
+      $row = multi_mysql_fetch_array($this->__result, $type);
+      $multi_ret = $this->__checkRow($row);
+      // This can be costy
+      if (is_multi($multi_ret)) {
+        $multi_ret = merge_multi($multi_ret);
+      }
+      return $multi_ret;
+    } else {
     return $this->__checkRow(
       mysql_fetch_array(
         $this->__result,
         $this->__mysqli_to_mysql_resulttype($resulttype),
       )
     );
+    }
   }
 
   /**
@@ -1165,8 +1221,16 @@ class mysqli_result {
    *   The data type used for this field   decimals The number of decimals
    *   used (for integer fields)
    */
-  <<__Native>>
-  public function fetch_field(): mixed;
+  // cheng-hack: Original case is implemented in ext_mysqli.cpp, we are using another version in ext_mysql.cpp
+  //<<__Native>>
+  //public function fetch_field(): mixed;
+  public function fetch_field() {
+    if (is_multi($this->__result)) {
+      return multi_mysql_fetch_field($this->__result);
+    } else {
+      return mysql_fetch_field($this->__result);
+    }
+  }
 
   /**
    * Returns an array of objects representing the fields in a result set
@@ -1210,10 +1274,19 @@ class mysqli_result {
   public function fetch_object(?string $class_name = null,
                                array $params = array()): mixed {
     if (func_num_args() == 0) {
-      $obj = mysql_fetch_object($this->__result);
+      // cheng-hack: avoid call __set multiple times
+      //$obj = mysql_fetch_object($this->__result);
+      $obj = multi_mysql_fetch_object($this->__result);
     } else {
-      $obj = mysql_fetch_object($this->__result, $class_name, $params);
+      //$obj = mysql_fetch_object($this->__result, $class_name, $params);
+      $obj = multi_mysql_fetch_object($this->__result, $class_name, $params);
     }
+    // cheng-hack:
+    // this can be costy
+    if (is_multi($obj)) {
+      $obj = merge_multi($obj);
+    }
+
     return $this->__checkRow($obj);
   }
 
@@ -1237,8 +1310,15 @@ class mysqli_result {
    * @return bool -
    */
   public function field_seek(int $fieldnr): bool {
+    if (is_multi($this->__result)) {
+      if (!multi_mysql_field_seek($this->__result, $fieldnr)) {
+        return false;
+      }
+    } else {
+      // original case:
     if (!mysql_field_seek($this->__result, $fieldnr)) {
       return false;
+    }
     }
 
     return true;
@@ -1250,7 +1330,11 @@ class mysqli_result {
    * @return void -
    */
   public function free(): void {
-    mysql_free_result($this->__result);
+    // cheng-hack: NOTE, the $this->__result may be duplicated
+    // because of query cluster, so that it may generate warnings
+    multi_mysql_free_result($this->__result);
+    // original:
+    // mysql_free_result($this->__result);
     $this->__result = null;
   }
 
@@ -2744,8 +2828,29 @@ function mysqli_field_seek(mysqli_result $result,
  *
  * @return void -
  */
-<<__Native>>
-function mysqli_free_result(mixed $result): void;
+// cheng-hack: for query clustering
+/*
+void HHVM_FUNCTION(mysqli_free_result, const Variant& result) {
+  if (!UNLIKELY(result.isObject()
+      && result.toObject().instanceof(s_mysqli_result))) {
+    raise_warning(
+        "mysqli_free_result() expects parameter 1 to be mysqli_result");
+  } else {
+    result.toObject()->o_invoke_few_args(s_free, 0);
+  }
+}
+ */
+function mysqli_free_result(mixed $results) {
+  if (!is_object($results)) {
+    trigger_error("mysqli_free_result() expects parameter 1 to be mysqli_result", E_WARNING);
+  } else {
+    $results->free();
+  }
+}
+
+// original case:
+//<<__Native>>
+//function mysqli_free_result(mixed $result): void;
 
 /**
  * Returns the lengths of the columns of the current row in the result set

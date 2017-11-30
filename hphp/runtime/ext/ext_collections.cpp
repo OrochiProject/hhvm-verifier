@@ -5574,6 +5574,7 @@ void collectionDeepCopyTV(TypedValue* tv) {
     case KindOfString:
     case KindOfResource:
     case KindOfRef:
+    case KindOfMulti:
       return;
 
     case KindOfArray: {

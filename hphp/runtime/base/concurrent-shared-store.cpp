@@ -97,6 +97,7 @@ EntryInfo::Type EntryInfo::getAPCType(const APCHandle* handle) {
 
     case KindOfResource:
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       return EntryInfo::Type::Unknown;
   }

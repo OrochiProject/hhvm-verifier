@@ -134,6 +134,7 @@ static folly::dynamic variant_to_dynamic(const Variant& v) {
       return ret;
     }
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

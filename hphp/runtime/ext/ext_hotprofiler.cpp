@@ -1144,7 +1144,8 @@ class MemoProfiler : public Profiler {
       auto& memo = m_memos[symbol];
       if (!memo.m_ignore) {
         auto args = hhvm_get_frame_args(ar, 0);
-        args.append((int64_t)(ar->getThis())); // Use the pointer not the obj
+        // cheng-hack:
+        args.append((int64_t)(ar->getThisSingle())); // Use the pointer not the obj
         VariableSerializer vs(VariableSerializer::Type::DebuggerSerialize);
         String sdata;
         try {

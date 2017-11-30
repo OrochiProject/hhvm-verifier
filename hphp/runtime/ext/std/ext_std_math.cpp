@@ -307,6 +307,7 @@ static MaybeDataType convert_for_pow(const Variant& val,
       // Not reachable since HHVM_FN(pow) deals with these base cases first.
     case KindOfRef:
     case KindOfClass:
+    case KindOfMulti:
       break;
   }
 

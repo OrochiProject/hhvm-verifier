@@ -468,6 +468,7 @@ static const struct {
   { OpNativeImpl,  {None,             None,         OutNone,           0 }},
   { OpCreateCl,    {BStackN,          Stack1,       OutObject,         1 }},
   { OpStrlen,      {Stack1,           Stack1,       OutStrlen,         0 }},
+  { OpAddMulti,    {StackTop3,        Stack1,       OutArray,         -2 }},
   { OpIncStat,     {None,             None,         OutNone,           0 }},
   { OpIdx,         {StackTop3,        Stack1,       OutUnknown,       -2 }},
   { OpArrayIdx,    {StackTop3,        Stack1,       OutUnknown,       -2 }},
@@ -1124,6 +1125,8 @@ bool dontGuardAnyInputs(Op op) {
   case Op::DefTypeAlias:
   case Op::Catch:
   case Op::HighInvalid:
+  // cheng-hack:FIXME I don't know this is good or not...
+  case Op::AddMulti:
     return true;
   }
 

@@ -625,6 +625,7 @@ String getDataTypeString(DataType t) {
     case KindOfResource:   return s_resource;
     case KindOfRef:        return s_ref;
 
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

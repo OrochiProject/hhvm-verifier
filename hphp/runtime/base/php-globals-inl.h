@@ -46,6 +46,8 @@ inline Variant php_global_exchange(const StaticString& name, Variant newV) {
 inline Variant php_global(const StaticString& name) {
   auto const tv = g_context->m_globalVarEnv->lookup(name.get());
   // Note: Variant is making unnecessary KindOfUninit checks here.
+  // cheng-hack: FIXME?: for me it seems it is ok to provide anyone
+  //             with the _SESSION array. Can we do it here?
   return tv ? tvAsCVarRef(tv) : uninit_null();
 }
 

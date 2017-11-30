@@ -59,6 +59,7 @@ enum DataType : int8_t {
   KindOfObject        = 0x30,  //  00110000
   KindOfResource      = 0x40,  //  01000000
   KindOfRef           = 0x50,  //  01010000
+  KindOfMulti         = 0x60,  //  01100000
 };
 
 /*
@@ -104,9 +105,9 @@ constexpr unsigned kDataTypeMask = 0x7f;
 /*
  * DataType limits.
  */
-constexpr int    kNumDataTypes = 12;
+constexpr int    kNumDataTypes = 13;
 constexpr int8_t kMinDataType  = KindOfClass;
-constexpr int8_t kMaxDataType  = KindOfRef;
+constexpr int8_t kMaxDataType  = /*KindOfRef*/ KindOfMulti;
 
 /*
  * KindOfStringBit must be set in KindOfStaticString and KindOfString, and it
@@ -135,6 +136,7 @@ constexpr DataType KindOfRefCountThreshold = KindOfStaticString;
 ///////////////////////////////////////////////////////////////////////////////
 // DataTypeCategory
 
+// TODO(cheng): WTF is this?!!!!
 // These must be kept in order from least to most specific.
 #define DT_CATEGORIES(func)                     \
   func(Generic)                                 \
@@ -169,6 +171,7 @@ static_assert(!(KindOfObject     & KindOfStringBit), "");
 static_assert(!(KindOfResource   & KindOfStringBit), "");
 static_assert(!(KindOfRef        & KindOfStringBit), "");
 static_assert(!(KindOfClass      & KindOfStringBit), "");
+static_assert(!(KindOfMulti      & KindOfStringBit), "");
 
 static_assert(KindOfNull         & KindOfUncountedInitBit, "");
 static_assert(KindOfBoolean      & KindOfUncountedInitBit, "");
@@ -182,6 +185,7 @@ static_assert(!(KindOfObject     & KindOfUncountedInitBit), "");
 static_assert(!(KindOfResource   & KindOfUncountedInitBit), "");
 static_assert(!(KindOfRef        & KindOfUncountedInitBit), "");
 static_assert(!(KindOfClass      & KindOfUncountedInitBit), "");
+static_assert(!(KindOfMulti       & KindOfUncountedInitBit), "");
 
 static_assert(KindOfUninit == 0,
               "Several things assume this tag is 0, especially RDS");
@@ -220,6 +224,7 @@ inline std::string tname(DataType t) {
     CS(Resource)
     CS(Ref)
     CS(Class)
+    CS(Multi)
 #undef CS
 
     default: {
@@ -259,6 +264,7 @@ inline int getDataTypeIndex(DataType type) {
     case KindOfObject       : return 8;
     case KindOfResource     : return 9;
     case KindOfRef          : return 10;
+    case KindOfMulti        : return 11;
     case KindOfClass        : break;  // Not a "real" DT.
   }
   not_reached();
@@ -277,21 +283,23 @@ inline DataType getDataTypeValue(unsigned index) {
     case 8:  return KindOfObject;
     case 9:  return KindOfResource;
     case 10: return KindOfRef;
+    case 11: return KindOfMulti;
     default: not_reached();
   }
 }
 
+// TODO(cheng): WTF is this also?!!!
 /*
  * These are used in type_variant.cpp and mc-generator.cpp.
  */
 const int kShiftDataTypeToDestrIndex = 4;
-const int kDestrTableSize = 6;
+const int kDestrTableSize = 7;
 
 #define TYPE_TO_DESTR_IDX(t) ((t) >> kShiftDataTypeToDestrIndex)
 
 ALWAYS_INLINE unsigned typeToDestrIndex(DataType t) {
   assert(t == KindOfString || t == KindOfArray || t == KindOfObject ||
-         t == KindOfResource || t == KindOfRef);
+         t == KindOfResource || t == KindOfRef || t == KindOfMulti);
   return TYPE_TO_DESTR_IDX(t);
 }
 
@@ -310,7 +318,7 @@ ALWAYS_INLINE unsigned typeToDestrIndex(DataType t) {
  * Whether a type is refcounted.
  */
 #define IS_REFCOUNTED_TYPE(t)                                   \
-  (assert(IS_REAL_TYPE(t)), (t) > HPHP::KindOfRefCountThreshold)
+  (assert(IS_REAL_TYPE(t)), ((t) > HPHP::KindOfRefCountThreshold) )
 
 /*
  * Whether a builtin return or param type is not a simple type.
@@ -355,6 +363,7 @@ IS_TYPE(INT,    Int64)
 IS_TYPE(BOOL,   Boolean)
 IS_TYPE(DOUBLE, Double)
 IS_TYPE(ARRAY,  Array)
+IS_TYPE(MULTI,  Multi)
 #undef IS_TYPE
 
 constexpr bool IS_INT_KEY_TYPE(DataType t) {

@@ -509,7 +509,8 @@ private:
                   ActRec::encodeNumArgs(m_params.size(),
                                         false /* localsDecRefd */,
                                         false /* resumed */,
-                                        m_kind == Kind::InliningCtor),
+                                        m_kind == Kind::InliningCtor,
+                                        false /* multi this*/),
                   nullptr);
     }
     for (auto i = uint32_t{0}; i < m_params.size(); ++i) {
@@ -1074,6 +1075,9 @@ void emitGetMemoKey(HTS& env) {
   auto const key = gen(env, GetMemoKey, obj);
   push(env, key);
   gen(env, DecRef, obj);
+}
+// cheng-hack: FIXME: this is totally not supported
+void emitAddMulti(HTS& env) {
 }
 
 void emitStrlen(HTS& env) {

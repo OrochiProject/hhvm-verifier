@@ -89,6 +89,7 @@ bool cellRelOp(Op op, Cell cell, int64_t val) {
       return op(cell.m_data.pres->o_toInt64(), val);
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -133,6 +134,7 @@ bool cellRelOp(Op op, Cell cell, double val) {
       return op(cell.m_data.pres->o_toDouble(), val);
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -187,6 +189,7 @@ bool cellRelOp(Op op, Cell cell, const StringData* val) {
     }
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -229,6 +232,7 @@ bool cellRelOp(Op op, Cell cell, const ArrayData* ad) {
       return op(false, true);
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -276,6 +280,7 @@ bool cellRelOp(Op op, Cell cell, const ObjectData* od) {
       return op(false, true);
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -316,6 +321,7 @@ bool cellRelOp(Op op, Cell cell, const ResourceData* rd) {
       return op(cell.m_data.pres, rd);
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -344,6 +350,7 @@ bool cellRelOp(Op op, Cell c1, Cell c2) {
   case KindOfResource:     return cellRelOp(op, c1, c2.m_data.pres);
 
   case KindOfRef:
+  case KindOfMulti:
   case KindOfClass:
     break;
   }
@@ -550,6 +557,7 @@ bool cellSame(Cell c1, Cell c2) {
     case KindOfUninit:
     case KindOfNull:
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

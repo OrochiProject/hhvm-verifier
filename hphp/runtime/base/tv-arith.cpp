@@ -72,6 +72,7 @@ TypedNum numericConvHelper(Cell cell) {
     case KindOfInt64:
     case KindOfDouble:
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -406,6 +407,7 @@ void cellIncDecOp(Op op, Cell& cell) {
       return;
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -664,6 +666,7 @@ void cellBitNot(Cell& cell) {
     case KindOfObject:
     case KindOfResource:
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       raise_error("Unsupported operand type for ~");
   }

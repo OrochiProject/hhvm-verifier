@@ -42,6 +42,7 @@
 
 #include "hphp/util/abi-cxx.h"
 #include "hphp/util/logger.h"
+#include "hphp/runtime/base/multi-val.h"
 
 #include <limits>
 #include <utility>
@@ -187,6 +188,17 @@ Variant::Variant(ObjectData* v) {
   }
 }
 
+// cheng-hack:
+Variant::Variant(MultiVal* v) {
+  if (v) {
+    m_type = KindOfMulti;
+    m_data.pmulti = v;
+    //v->incRefCount();
+  } else {
+    m_type = KindOfNull;
+  }
+}
+
 Variant::Variant(ResourceData* v) {
   if (v) {
     m_type = KindOfResource;
@@ -272,8 +284,9 @@ static_assert(TYPE_TO_DESTR_IDX(KindOfObject) == 3, "Object destruct index");
 static_assert(TYPE_TO_DESTR_IDX(KindOfResource) == 4,
               "Resource destruct index");
 static_assert(TYPE_TO_DESTR_IDX(KindOfRef)    == 5,    "Ref destruct index");
+static_assert(TYPE_TO_DESTR_IDX(KindOfMulti)    == 6,    "Multi destruct index");
 
-static_assert(kDestrTableSize == 6,
+static_assert(kDestrTableSize == 7,
               "size of g_destructors[] must be kDestrTableSize");
 
 const RawDestructor g_destructors[] = {
@@ -283,6 +296,7 @@ const RawDestructor g_destructors[] = {
   (RawDestructor)getMethodPtr(&ObjectData::release),
   (RawDestructor)getMethodPtr(&ResourceData::release),
   (RawDestructor)getMethodPtr(&RefData::release),
+  (RawDestructor)getMethodPtr(&MultiVal::release),
 };
 
 Variant::~Variant() {
@@ -295,7 +309,7 @@ Variant::~Variant() {
 void tvDecRefHelper(DataType type, uint64_t datum) {
   assert(type == KindOfString || type == KindOfArray ||
          type == KindOfObject || type == KindOfResource ||
-         type == KindOfRef);
+         type == KindOfRef || type == KindOfMulti);
   if (((ArrayData*)datum)->decReleaseCheck()) {
     g_destructors[typeToDestrIndex(type)]((void*)datum);
   }
@@ -377,6 +391,7 @@ int Variant::getRefCount() const {
   switch (m_type) {
     DT_UNCOUNTED_CASE:
       return 1;
+    case KindOfMulti:     return m_data.pmulti->getCount();
     case KindOfString:    return m_data.pstr->getCount();
     case KindOfArray:     return m_data.parr->getCount();
     case KindOfObject:    return m_data.pobj->getCount();
@@ -423,6 +438,7 @@ DataType Variant::toNumeric(int64_t &ival, double &dval,
     case KindOfRef:
       return m_data.pref->var()->toNumeric(ival, dval, checkString);
 
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -448,6 +464,7 @@ bool Variant::isScalar() const {
     case KindOfRef:
       always_assert(false && "isScalar() called on a boxed value");
 
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -479,6 +496,8 @@ bool Variant::toBooleanHelper() const {
     case KindOfObject:        return m_data.pobj->toBoolean();
     case KindOfResource:      return m_data.pres->o_toBoolean();
     case KindOfRef:           return m_data.pref->var()->toBoolean();
+    case KindOfMulti:
+         return tvAsVariant(m_data.pmulti->getByVal(0)).toBoolean();
     case KindOfClass:         break;
   }
   not_reached();
@@ -498,6 +517,7 @@ int64_t Variant::toInt64Helper(int base /* = 10 */) const {
     case KindOfObject:        return m_data.pobj->toInt64();
     case KindOfResource:      return m_data.pres->o_toInt64();
     case KindOfRef:           return m_data.pref->var()->toInt64(base);
+    case KindOfMulti:         break;
     case KindOfClass:         break;
   }
   not_reached();
@@ -516,6 +536,7 @@ double Variant::toDoubleHelper() const {
     case KindOfObject:        return m_data.pobj->toDouble();
     case KindOfResource:      return m_data.pres->o_toDouble();
     case KindOfRef:           return m_data.pref->var()->toDouble();
+    case KindOfMulti:         break;
     case KindOfClass:         break;
   }
   not_reached();
@@ -555,6 +576,10 @@ String Variant::toStringHelper() const {
     case KindOfRef:
       return m_data.pref->var()->toString();
 
+    // TODO(cheng): a pretty print here
+    case KindOfMulti:
+      return String::FromCStr(pretty().c_str());
+
     case KindOfClass:
       break;
   }
@@ -574,6 +599,7 @@ Array Variant::toArrayHelper() const {
     case KindOfObject:        return m_data.pobj->toArray();
     case KindOfResource:      return m_data.pres->o_toArray();
     case KindOfRef:           return m_data.pref->var()->toArray();
+    case KindOfMulti:         break;
     case KindOfClass:         break;
   }
   not_reached();
@@ -605,6 +631,7 @@ Object Variant::toObjectHelper() const {
     case KindOfRef:
       return m_data.pref->var()->toObject();
 
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -630,6 +657,7 @@ Resource Variant::toResourceHelper() const {
     case KindOfRef:
       return m_data.pref->var()->toResource();
 
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -668,6 +696,8 @@ VarNR Variant::toKey() const {
     case KindOfRef:
       return m_data.pref->var()->toKey();
 
+    case KindOfMulti:
+      cheng_assert(false);
     case KindOfClass:
       break;
   }
@@ -747,6 +777,7 @@ void Variant::setEvalScalar() {
     case KindOfObject:
     case KindOfResource:
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -777,6 +808,10 @@ void Variant::serialize(VariableSerializer *serializer,
     }
     return;
   }
+
+  // cheng-hack:
+  std::stringstream ss;
+  StringData* ptr;
 
   switch (m_type) {
     case KindOfUninit:
@@ -817,6 +852,13 @@ void Variant::serialize(VariableSerializer *serializer,
     case KindOfResource:
       assert(!isArrayKey);
       m_data.pres->serialize(serializer);
+      return;
+
+      // in order to support print_r()
+    case KindOfMulti:
+      assert(!isArrayKey);
+      ptr = StringData::Make(m_data.pmulti->dump().c_str());
+      serializer->write(String(ptr));
       return;
 
     case KindOfRef:

@@ -220,14 +220,20 @@ void assertTv(const TypedValue* tv) {
 }
 
 int init_closure(ActRec* ar, TypedValue* sp) {
-  c_Closure* closure = static_cast<c_Closure*>(ar->getThis());
+  // cheng-hack: no idea
+  c_Closure* closure = static_cast<c_Closure*>(ar->getThisSingle());
 
   // Swap in the $this or late bound class or null if it is ony from a plain
   // function or pseudomain
   ar->setThisOrClassAllowNull(closure->getThisOrClass());
 
   if (ar->hasThis()) {
-    ar->getThis()->incRefCount();
+    // cheng-hack:
+    if (ar->isMultiThis()) {
+      for (auto it : *ar->getThisMulti()) { it->incRefCount(); }
+    } else {
+    ar->getThisSingle()->incRefCount();
+    }
   }
 
   // Put in the correct context

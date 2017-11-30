@@ -239,7 +239,7 @@ String c_AsyncFunctionWaitHandle::getName() {
 
       String clsName;
       if (actRec()->hasThis()) {
-        clsName = const_cast<StringData*>(actRec()->getThis()->
+        clsName = const_cast<StringData*>(actRec()->getThisDefault()->
                                           getVMClass()->name());
       } else if (actRec()->hasClass()) {
         clsName = const_cast<StringData*>(actRec()->getClass()->name());

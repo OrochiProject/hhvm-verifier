@@ -641,7 +641,8 @@ void processFunc(const PhpFunc& func, std::ostream& header,
     auto cklass = "c_" + func.className();
     cpp << in
         << cklass << "* this_ = (ar->hasThis() ? "
-        << "static_cast<" << cklass << "*>(ar->getThis()) : "
+        // cheng-hack: no idea
+        << "static_cast<" << cklass << "*>(ar->getThisSingle()) : "
         << " nullptr);\n";
     cpp << in << "if (LIKELY(this_ != nullptr)) {\n";
     in -= 2;

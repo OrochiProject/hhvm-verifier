@@ -42,6 +42,7 @@
 #include "hphp/runtime/vm/vm-regs.h"
 #include "hphp/util/logger.h"
 #include "hphp/util/concurrent-scalable-cache.h"
+#include "hphp/runtime/ext/std/ext_std_variable.h"
 
 /* Only defined in pcre >= 8.32 */
 #ifndef PCRE_STUDY_JIT_COMPILE
@@ -1116,10 +1117,12 @@ static Variant preg_match_impl(const String& pattern, const String& subject,
 Variant preg_match(const String& pattern, const String& subject,
                    Variant &matches, int flags /* = 0 */,
                    int offset /* = 0 */) {
+  //std::cout << "==Has matches===\n";
   return preg_match_impl(pattern, subject, &matches, flags, offset, false);
 }
 Variant preg_match(const String& pattern, const String& subject,
                    int flags /* = 0 */, int offset /* = 0 */) {
+  //std::cout << "==No matches===\n";
   return preg_match_impl(pattern, subject, nullptr, flags, offset, false);
 }
 
@@ -1135,7 +1138,8 @@ Variant preg_match_all(const String& pattern, const String& subject,
 
 ///////////////////////////////////////////////////////////////////////////////
 
-static String preg_do_repl_func(const Variant& function, const String& subject,
+// cheng-hack: this can return String or multi-string
+static Variant cheng_preg_do_repl_func(const Variant& function, const String& subject,
                                 int* offsets, const char* const* subpat_names,
                                 int count) {
   Array subpats = Array::Create();
@@ -1153,6 +1157,12 @@ static String preg_do_repl_func(const Variant& function, const String& subject,
   Array args;
   args.set(0, subpats);
   return vm_call_user_func(function, args);
+}
+
+static String preg_do_repl_func(const Variant& function, const String& subject,
+                                int* offsets, const char* const* subpat_names,
+                                int count) {
+  return cheng_preg_do_repl_func(function, subject, offsets, subpat_names, count);
 }
 
 static bool preg_get_backref(const char** str, int* backref) {
@@ -1289,8 +1299,15 @@ static Variant php_pcre_replace(const String& pattern, const String& subject,
         String eval_result;
         if (callable) {
           /* Use custom function to get replacement string and its length. */
-          eval_result = preg_do_repl_func(replace_var, subject, offsets,
+          auto result = cheng_preg_do_repl_func(replace_var, subject, offsets,
                                           subpat_names, count);
+          if (result.isString()) {
+            eval_result = result;
+          } else {
+            // if the return is multi, just return (is this OK?)
+            cheng_assert(result.m_type == KindOfMulti);
+            return result;
+          }
         } else { /* do regular substitution */
           walk = replace;
           walk_last = 0;
@@ -1559,7 +1576,6 @@ Variant preg_replace_impl(const Variant& pattern, const Variant& replacement,
         return ret.asStrRef();
       }
     }
-
     return ret;
   }
 

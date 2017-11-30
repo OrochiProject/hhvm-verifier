@@ -19,12 +19,14 @@
 #include "hphp/runtime/base/preg.h"
 
 #include <pcre.h>
+#include "fstream"
 
 #include "hphp/runtime/ext/mbstring/ext_mbstring.h"
 #include "hphp/runtime/ext/std/ext_std_function.h"
 #include "hphp/runtime/ext/string/ext_string.h"
 #include "hphp/runtime/base/ini-setting.h"
 #include "hphp/runtime/base/request-local.h"
+#include "hphp/runtime/ext/std/ext_std_variable.h"
 
 namespace HPHP {
 
@@ -42,6 +44,8 @@ Variant HHVM_FUNCTION(preg_grep, const String& pattern, const Array& input,
 Variant HHVM_FUNCTION(preg_match, const String& pattern, const String& subject,
                                   VRefParam matches /* = null */,
                                   int flags /* = 0 */, int offset /* = 0 */) {
+ // std::cout << "========= " << matches->getRefCount() 
+              //<< "," << matches.isReferenced() << "\n";
   if (matches.isReferenced()) {
     return preg_match(pattern, subject, matches, flags, offset);
   } else {
@@ -71,15 +75,56 @@ Variant HHVM_FUNCTION(preg_replace, const Variant& pattern, const Variant& repla
                            limit, count, false, false);
 }
 
+// cheng-hack: support multivalue subject
+extern thread_local bool single_mode_on;
+extern thread_local int  single_mode_cur_iter;
+//#define CHENG_INS_ONLY_DEBUG_LOCAL
+#ifdef CHENG_INS_ONLY_DEBUG_LOCAL
+extern std::ofstream debug_log;
+#endif
 Variant HHVM_FUNCTION(preg_replace_callback, const Variant& pattern, const Variant& callback,
                                              const Variant& subject,
                                              int limit /* = -1 */,
                                              VRefParam count /* = null */) {
+  cheng_assert(pattern.m_type != KindOfMulti);
+  cheng_assert(callback.m_type != KindOfMulti);
   if (!HHVM_FN(is_callable)(callback)) {
     raise_warning("Not a valid callback function %s",
         callback.toString().data());
     return empty_string_variant();
   }
+
+  if (UNLIKELY(subject.m_type == KindOfMulti)) {
+    int size = subject.m_data.pmulti->valSize();
+    auto multi_ret = MultiVal::makeMultiVal();
+    int final_count = -1;
+    single_mode_on = true; // start single mode, since the callable may call the global function
+#ifdef CHENG_INS_ONLY_DEBUG_LOCAL
+    debug_log << "in preg_replace_callback: single_mode_on = true\n";
+#endif
+    for (int i = 0; i<size; i++) {
+      auto tmp_sub = subject.m_data.pmulti->getByVal(i);
+      auto tmp_var = tvAsVariant(tmp_sub);
+
+      single_mode_cur_iter = i;
+      auto ret = preg_replace_impl(pattern, callback, tmp_var,
+                           limit, count, true, false);
+      
+      if (!count.isNull()) {
+        if (final_count == -1) final_count = (int)count;
+        cheng_assert(final_count == (int)count);
+      }
+      multi_ret.m_data.pmulti->addValue(ret);
+    }
+    // shut down the single mode
+    single_mode_on = false;
+#ifdef CHENG_INS_ONLY_DEBUG_LOCAL
+    debug_log << "in preg_replace_callback: single_mode_on = false\n";
+#endif
+    single_mode_cur_iter = -1;
+    return tvAsVariant(&multi_ret);
+  }
+
   return preg_replace_impl(pattern, callback, subject,
                            limit, count, true, false);
 }

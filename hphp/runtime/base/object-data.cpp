@@ -1555,6 +1555,7 @@ void ObjectData::setProp(Class* ctx,
   tvRefcountedDecRef(&ignored);
 }
 
+//extern void write_to_debug_log(std::string symbol, std::string log);
 TypedValue* ObjectData::setOpProp(TypedValue& tvRef,
                                   Class* ctx,
                                   SetOpOp op,
@@ -1565,6 +1566,9 @@ TypedValue* ObjectData::setOpProp(TypedValue& tvRef,
 
   if (prop && lookup.accessible) {
     if (prop->m_type == KindOfUninit && getAttribute(UseGet)) {
+      // FIXME: doesn't support this situation
+      cheng_assert(val->m_type != KindOfMulti);
+      // prop doesn't exist
       auto tvResult = make_tv<KindOfUninit>();
       if (invokeGet(&tvResult, key)) {
         SETOP_BODY(&tvResult, op, val);
@@ -1583,10 +1587,52 @@ TypedValue* ObjectData::setOpProp(TypedValue& tvRef,
       }
     }
 
+    // prop exists
     prop = tvToCell(prop);
-    SETOP_BODY_CELL(prop, op, val);
-    return prop;
+    if (UNLIKELY(prop->m_type == KindOfMulti || val->m_type == KindOfMulti)) {
+      Cell* cur_prop = prop;
+      Cell* cur_val = val;
+      int size = 0;
+      bool prop_multi = (prop->m_type == KindOfMulti);
+      bool val_multi = (val->m_type == KindOfMulti);
+      if (prop_multi) size = prop->m_data.pmulti->valSize();
+      if (val_multi) size = val->m_data.pmulti->valSize();
+
+      // if prop is multi, we can do the <op>= to its own separate element
+      if (prop_multi) {
+        for (int i=0; i<size; i++) {
+          cur_prop = prop->m_data.pmulti->getByVal(i);
+          if (val_multi) cur_val = val->m_data.pmulti->getByVal(i);
+          SETOP_BODY_CELL(cur_prop, op, cur_val);
+        }
+      }
+      // if prop is not multi, we should build a multi, and add the result to it
+      else {
+        auto multi_ret = MultiVal::makeMultiVal();
+        for (int i=0; i<size; i++) {
+          auto tmp_prop = *prop;
+          cur_val = val->m_data.pmulti->getByVal(i);
+          // Used to be a BUG: the ref of tmp_prop will decrease in SETOP_BODY_CELL 
+          if (tmp_prop.m_type == KindOfString) {
+            //write_to_debug_log( __FILE__+__LINE__, tmp_prop.pretty() + "   refcount: " + std::to_string(tmp_prop.m_data.pstr->getCount()));
+            prop->m_data.pstr->incRefCount();
+          }
+          SETOP_BODY_CELL(&tmp_prop, op, cur_val);
+          multi_ret.m_data.pmulti->addValueNoInc(tmp_prop);
+        }
+        tvRefcountedDecRef(prop);
+        tvCopy(multi_ret, *prop);
+      }
+      return prop;
+    } else {
+      SETOP_BODY_CELL(prop, op, val);
+      return prop;
+    }
   }
+
+  // FIXME: do not support the following cases
+  cheng_assert(prop->m_type != KindOfMulti);
+  cheng_assert(val->m_type != KindOfMulti);
 
   if (UNLIKELY(!*key->data())) throw_invalid_property_name(StrNR(key));
 
@@ -1893,6 +1939,45 @@ Variant ObjectData::invokeWakeup() {
   return invokeSimple(this, s___wakeup);
 }
 
+
+Variant ObjectData::invokeToStringMayMulti() {
+  const Func* method = m_cls->getToString();
+  if (!method) {
+    // If the object does not define a __toString() method, raise a
+    // recoverable error
+    raise_recoverable_error(
+      "Object of class %s could not be converted to string",
+      classname_cstr()
+    );
+    // If the user error handler decides to allow execution to continue,
+    // we return the empty string.
+    return empty_string();
+  }
+  auto const tv = g_context->invokeMethod(this, method);
+  // cheng-hack: this also can be a multi-string
+  // FIXME: this is not oracle solution, since the program may latter manipulate this string.
+  if (UNLIKELY(tv.m_type == KindOfMulti)) {
+    cheng_assert(IS_STRING_TYPE(tv.m_data.pmulti->getType()));
+    TypedValue tmp = tv;
+    return tvAsVariant(&tmp);
+  }
+
+  if (!IS_STRING_TYPE(tv.m_type)) {
+    // Discard the value returned by the __toString() method and raise
+    // a recoverable error
+    tvRefcountedDecRef(tv);
+    raise_recoverable_error(
+      "Method %s::__toString() must return a string value",
+      m_cls->preClass()->name()->data());
+    // If the user error handler decides to allow execution to continue,
+    // we return the empty string.
+    return empty_string();
+  }
+  String ret = tv.m_data.pstr;
+  decRefStr(tv.m_data.pstr);
+  return ret;
+}
+
 String ObjectData::invokeToString() {
   const Func* method = m_cls->getToString();
   if (!method) {
@@ -1907,6 +1992,20 @@ String ObjectData::invokeToString() {
     return empty_string();
   }
   auto const tv = g_context->invokeMethod(this, method);
+  // cheng-hack: this also can be a multi-string
+  // FIXME: this is not oracle solution, since the program may latter manipulate this string.
+  if (UNLIKELY(tv.m_type == KindOfMulti)) {
+    cheng_assert(IS_STRING_TYPE(tv.m_data.pmulti->getType()));
+    std::stringstream ss;    
+    ss << "[{";
+    int size = tv.m_data.pmulti->valSize();
+    for (int i=0; i<size; i++) {
+      ss << tv.m_data.pmulti->getByVal(i)->m_data.pstr->toCppString() << "|||";
+    }
+    ss << "}]";
+    return Variant(ss.str());
+  }
+
   if (!IS_STRING_TYPE(tv.m_type)) {
     // Discard the value returned by the __toString() method and raise
     // a recoverable error

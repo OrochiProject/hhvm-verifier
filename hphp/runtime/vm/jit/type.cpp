@@ -391,6 +391,7 @@ Type::bits_t Type::bitsFromDataType(DataType outer, DataType inner) {
     case KindOfRef:
       assert(inner != KindOfUninit);
       return bitsFromDataType(inner, KindOfUninit) << kBoxShift;
+    case KindOfMulti: break;
   }
   not_reached();
 }

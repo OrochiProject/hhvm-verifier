@@ -205,7 +205,13 @@ Array createBacktrace(const BacktraceArgs& btArgs) {
         frame.set(s_class, ctx->name()->data());
         if (fp->hasThis() && !isReturning) {
           if (btArgs.m_withThis) {
-            frame.set(s_object, Object(fp->getThis()));
+            // cheng-hack:
+            if (fp->isMultiThis()) {
+              frame.set(s_object, Object(fp->getThisDefault()));
+            } else {
+              // normal case
+              frame.set(s_object, Object(fp->getThisSingle()));
+            }
           }
           frame.set(s_type, "->");
         } else {

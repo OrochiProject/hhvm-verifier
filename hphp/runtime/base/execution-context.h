@@ -163,6 +163,7 @@ public:
   void write(const String&);
   void write(const char* s, int len);
   void write(const char*);
+  void write_multi(MultiVal* m); // cheng-hack
 
   void writeStdout(const char* s, int len);
   size_t getStdoutBytesWritten() const;
@@ -184,6 +185,7 @@ public:
   void obEndAll();
   int obGetLevel();
   Array obGetStatus(bool full);
+
   void obSetImplicitFlush(bool on);
   Array obGetHandlers();
   void obProtect(bool on); // making sure obEnd() never passes current level
@@ -191,6 +193,24 @@ public:
   StringBuffer* swapOutputBuffer(StringBuffer*);
   String getRawPostData() const;
   void setRawPostData(const String& pd);
+
+
+  /**
+   * cheng-hack:
+   * Multi Output buffering 
+   */
+  void multiObPrepare();
+  void multiResetCurrentBuffer();
+  void multiObStart(const Variant& handler = uninit_null(), int chunk_size = 0);
+  std::vector<String> multiObCopyContents();
+  std::vector<int> multiObGetContentLength();
+  void multiObClean(int handler_flag);
+  bool multiObFlush();
+  void multiObFlushAll();
+  bool multiObEnd();
+  void multiObEndAll();
+  int multiObGetLevel();
+  std::vector<Array> multiObGetStatus(bool full);
 
   /**
    * Request sequences and program execution hooks.
@@ -325,6 +345,10 @@ public:
   ObjectData* initObject(StringData* clsName,
                          const Variant& params,
                          ObjectData* o);
+  // cheng-hack: for multi-this call their __construct() once
+  sptr<std::vector<ObjectData*> > initObject_multi (StringData* clsName,
+                                 const Variant& params,
+                                 sptr< std::vector<ObjectData*> > o_arr);
   ObjectData* createObjectOnly(StringData* clsName);
 
   /*
@@ -413,7 +437,9 @@ public:
                   Class* class_ = nullptr,
                   VarEnv* varEnv = nullptr,
                   StringData* invName = nullptr,
-                  InvokeFlags flags = InvokeNormal);
+                  InvokeFlags flags = InvokeNormal,
+                  sptr< std::vector<ObjectData*> > multi_this_ = nullptr/*cheng-hack*/
+                  );
 
   void invokeFunc(TypedValue* retval,
                   const CallCtx& ctx,
@@ -464,6 +490,19 @@ public:
 
 ///////////////////////////////////////////////////////////////////////////////
 // only fields past here, please.
+ 
+//=========cheng-hack: multi ob==========
+public:
+  bool m_isMultiObs = false;
+private:
+  bool m_obExists = false;  // indicates whehter there are ob exists before php_code_running 
+  bool m_multiInit = false; // check if the first time running multiObStart
+  int  m_protectedLevel_resv = 0;
+  int  m_initob_level = 0;
+  smart::list<OutputBuffer>* m_multi_out = nullptr; // current OutputBuffer
+  smart::list<smart::list<OutputBuffer>> m_multi_buffers; // a stack of output buffers
+//=======================================
+
 private:
   // system settings
   Transport* m_transport;

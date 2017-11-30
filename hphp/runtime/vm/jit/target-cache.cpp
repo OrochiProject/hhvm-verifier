@@ -162,7 +162,8 @@ void raiseFatal(ActRec* ar, Class* cls, StringData* name, Class* ctx) {
     );
     not_reached();
   } catch (...) {
-    auto const obj = ar->getThis();
+    // cheng-hack: crash anyway
+    auto const obj = ar->getThisSingle();
     *arPreliveOverwriteCells(ar) = make_tv<KindOfObject>(obj);
     throw;
   }
@@ -175,7 +176,8 @@ void nullFunc(ActRec* ar, StringData* name) {
                   name->data());
     ar->m_func = SystemLib::s_nullFunc;
   } catch (...) {
-    auto const obj = ar->getThis();
+    // cheng-hack: no idea
+    auto const obj = ar->getThisSingle();
     *arPreliveOverwriteCells(ar) = make_tv<KindOfObject>(obj);
     throw;
   }
@@ -212,8 +214,9 @@ void lookup(Entry* mce, ActRec* ar, StringData* name, Class* cls, Class* ctx) {
   ar->m_func   = func;
 
   if (UNLIKELY(isStatic && !func->isClosureBody())) {
-    auto const obj = ar->getThis();
-    if (debug) ar->setThis(nullptr); // suppress assert
+    // cheng-hack: no idea
+    auto const obj = ar->getThisSingle();
+    if (debug) ar->setThisSingle(nullptr); // suppress assert
     ar->setClass(cls);
     decRefObj(obj);
   }
@@ -244,8 +247,9 @@ void readMagicOrStatic(Entry* mce,
 
   assert(mceKey & 0x2u);
   if (LIKELY(!mceValue->isClosureBody())) {
-    auto const obj = ar->getThis();
-    if (debug) ar->setThis(nullptr); // suppress assert in setClass
+    // cheng-hack: no idea
+    auto const obj = ar->getThisSingle();
+    if (debug) ar->setThisSingle(nullptr); // suppress assert in setClass
     ar->setClass(cls);
     decRefObj(obj);
   }
@@ -259,8 +263,9 @@ void readPublicStatic(Entry* mce,
                       const Func* cand) {
   mce->m_key = reinterpret_cast<uintptr_t>(cls) | 0x2u;
   if (LIKELY(!cand->isClosureBody())) {
-    auto const obj = ar->getThis();
-    if (debug) ar->setThis(nullptr); // suppress assert in setClass
+    // cheng-hack: no idea
+    auto const obj = ar->getThisSingle();
+    if (debug) ar->setThisSingle(nullptr); // suppress assert in setClass
     ar->setClass(cls);
     decRefObj(obj);
   }
@@ -274,7 +279,7 @@ void handleSlowPath(Entry* mce,
                     Class* ctx,
                     uintptr_t mcePrime) {
   assert(ar->hasThis());
-  assert(ar->getThis()->getVMClass() == cls);
+  assert(ar->getThisDefault()->getVMClass() == cls);
   assert(IMPLIES(mce->m_key, mce->m_value));
   assert(name->isStatic());
 

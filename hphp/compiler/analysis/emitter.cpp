@@ -4077,6 +4077,19 @@ bool EmitterVisitor::visit(ConstructPtr node) {
             e.Strlen();
             return true;
           }
+        } else if (call->isCallToFunction("add_multi")) {
+          // cheng-hack:
+          if (params && params->getCount() == 3) {
+            visit((*params)[0]);
+            emitConvertToCell(e);
+            visit((*params)[1]);
+            emitConvertToCell(e);
+            visit((*params)[2]);
+            emitConvertToCell(e);
+            call->changeToBytecode();
+            e.AddMulti();
+            return true;
+          }
         } else if (call->isCallToFunction("define")) {
           if (params && params->getCount() == 2) {
             ExpressionPtr p0 = (*params)[0];
@@ -4485,6 +4498,7 @@ bool EmitterVisitor::visit(ConstructPtr node) {
           case KindOfObject:
           case KindOfResource:
           case KindOfRef:
+          case KindOfMulti:
           case KindOfClass:
             break;
         }
@@ -5319,6 +5333,7 @@ void EmitterVisitor::emitBuiltinDefaultArg(Emitter& e, Variant& v,
             case KindOfInt64:
             case KindOfDouble:
             case KindOfRef:
+            case KindOfMulti:
             case KindOfClass:
               break;
           }
@@ -5359,6 +5374,7 @@ void EmitterVisitor::emitBuiltinDefaultArg(Emitter& e, Variant& v,
     case KindOfObject:
     case KindOfResource:
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

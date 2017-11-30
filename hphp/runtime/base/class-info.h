@@ -305,6 +305,7 @@ public:
       case KindOfStaticString:
       case KindOfRef:
       case KindOfClass:
+      case KindOfMulti:
         break;
     }
     not_reached();

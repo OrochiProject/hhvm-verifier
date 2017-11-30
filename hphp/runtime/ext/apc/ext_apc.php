@@ -200,3 +200,19 @@ function apc_cas(string $key,
  */
 <<__Native>>
 function apc_exists(mixed $key): mixed;
+
+// cheng-hack:
+<<__Native>>
+function oro_apc_store_check(mixed $key, mixed $var, mixed $req_no, int $op_num): mixed;
+<<__Native>>
+function oro_apc_dec_check(mixed $key, int $step=1, mixed $req_no, int $op_num): mixed;
+<<__Native>>
+function oro_apc_delete_check(mixed $key, mixed $req_no, int $op_num): mixed;
+<<__Native>>
+function oro_apc_fetch_check(mixed $key, mixed $req_no, int $op_num): mixed;
+<<__Native>>
+function set_site_root(string $root): void;
+<<__Native>>
+function gen_site_root_placeholder(int $len) : string;
+<<__Native>>
+function oro_apc_inc_check(mixed $key, int $step = 1, mixed $req_no, int $op_num): mixed;

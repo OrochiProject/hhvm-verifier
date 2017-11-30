@@ -42,6 +42,7 @@ SSATmp* staticTVCns(HTS& env, const TypedValue* tv) {
     case KindOfResource:
     case KindOfRef:
     case KindOfClass:
+    case KindOfMulti:
       break;
   }
   always_assert(false);

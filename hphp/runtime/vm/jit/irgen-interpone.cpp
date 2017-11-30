@@ -162,6 +162,8 @@ folly::Optional<Type> interpOutputType(HTS& env,
     }
     case OutStrlen:
       return topType(env, 0) <= Type::Str ? Type::Int : Type::UncountedInit;
+      // cheng-hack: FIXME: I suppose this work in JIT, not correct
+    case OutAddMulti:   return Type::Res;
     case OutClassRef:   return Type::Cls;
     case OutFPushCufSafe: return folly::none;
 

@@ -216,6 +216,7 @@ struct ObjectData {
 
   Variant offsetGet(Variant key);
   String invokeToString();
+  Variant invokeToStringMayMulti();
   bool hasToString();
 
   Variant invokeSleep();

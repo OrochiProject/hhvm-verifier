@@ -45,6 +45,7 @@
 #include "hphp/runtime/base/variable-unserializer.h"
 #include "hphp/runtime/base/php-globals.h"
 #include "hphp/runtime/base/zend-math.h"
+#include "hphp/runtime/base/multi-val.h"
 #include "hphp/runtime/ext/std/ext_std_function.h"
 #include "hphp/runtime/ext/ext_hash.h"
 #include "hphp/runtime/ext/std/ext_std_misc.h"
@@ -222,8 +223,18 @@ const StaticString
   s__POST("_POST");
 
 String SessionModule::create_sid() {
-  String remote_addr = php_global(s__SERVER)
-    .toArray()[s_REMOTE_ADDR].toString();
+  // cheng-hack:
+  //  we do not care what should be correct here, it just wants a random name.
+  auto server_arr = php_global(s__SERVER);
+  always_assert(server_arr.m_type != KindOfMulti);
+  //if (server_arr.m_type == KindOfMulti) {
+  //  server_arr = tvAsVariant(server_arr.m_data.pmulti->getByVal(0));
+  //}
+  auto remote_addr_may_multi = server_arr.toArray()[s_REMOTE_ADDR];
+  if (remote_addr_may_multi.m_type == KindOfMulti) {
+    remote_addr_may_multi = tvAsVariant(remote_addr_may_multi.m_data.pmulti->getByVal(0));
+  }
+  String remote_addr = remote_addr_may_multi.toString(); 
 
   struct timeval tv;
   gettimeofday(&tv, NULL);
@@ -1334,6 +1345,9 @@ new_session:
 }
 
 static void php_session_save_current_state() {
+  // cheng-hack: FIXME
+  // In our system, we don't maintain any data between different executions
+  /*
   bool ret = false;
   if (mod_is_open()) {
     String value = php_session_encode();
@@ -1346,6 +1360,7 @@ static void php_session_save_current_state() {
                   "current setting of session.save_path is correct (%s)",
                   PS(mod)->getName(), PS(save_path).c_str());
   }
+  */
   if (mod_is_open()) {
     PS(mod)->close();
   }
@@ -1667,12 +1682,76 @@ static Variant HHVM_FUNCTION(session_encode) {
   return ret;
 }
 
-static bool HHVM_FUNCTION(session_decode, const String& data) {
+// cheng-hack: if session array is multi-value
+Variant HHVM_FUNCTION(multi_session_encode) {
+  struct TypedValue mret = MultiVal::makeMultiVal();
+
+  // make sure _SESSION is multi-value
+  Variant sess = php_global(s__SESSION);
+  int num_multi_sess = MultiVal::containMultiVal(sess.asTypedValue());
+
+  if (num_multi_sess != 0) {
+    // set each array as _SESSION
+    for (int i=0; i<num_multi_sess; i++) {
+      auto cur_sess = MultiVal::selectIthVal(sess, i);
+
+      cheng_assert(cur_sess.m_type == KindOfArray);
+      php_global_set(s__SESSION, tvAsVariant(&cur_sess));
+
+      // call the normal encode
+      String str = php_session_encode();
+
+      // collect results
+      mret.m_data.pmulti->addValue(Variant(str));
+    }
+
+    // reset to original multival
+    php_global_set(s__SESSION, sess);
+    return tvAsVariant(&mret);
+  } else {
+    // normal 
+    String ret = php_session_encode();
+    if (ret.isNull()) {
+      return false;
+    }
+    return ret;
+  }
+}
+
+// cheng-hack: original session_decode
+//static bool HHVM_FUNCTION(session_decode, const String& data) {
+static bool _session_decode (const String& data) {
   if (PS(session_status) != Session::None) {
     php_session_decode(data);
     return true;
   }
   return false;
+}
+// cheng-hack: this is new session_decode
+static bool HHVM_FUNCTION(session_decode, const Variant& data) {
+  if (data.m_type == KindOfMulti) {
+    // FIXME: this is for PHP decoder only!
+    // always_assert(PS(serializer) instanceof PhpSessionSerializer);
+    Variant sess;
+    struct TypedValue session_array = MultiVal::makeMultiVal();
+
+    for (auto it : *(data.m_data.pmulti)) {
+      always_assert(it->m_type == KindOfString || it->m_type == KindOfStaticString);
+      //std::cout << it->m_data.pstr->toCppString() << "\n";
+      if (_session_decode(String(it->m_data.pstr))) {
+        sess = php_global_exchange(s__SESSION, init_null());
+        session_array.m_data.pmulti->addValue(sess);
+      } else {
+        php_global_set(s__SESSION, init_null());
+        return false;
+      }
+    }
+    php_global_set(s__SESSION, tvAsVariant(&session_array));
+    return true;
+  } else {
+    // normal case
+    return _session_decode(data.toString());
+  }
 }
 
 const StaticString
@@ -1836,6 +1915,7 @@ static void HHVM_FUNCTION(session_unset) {
   return;
 }
 
+// cheng-hack: this is original session_write_close
 static void HHVM_FUNCTION(session_write_close) {
   if (PS(session_status) == Session::Active) {
     PS(session_status) = Session::None;
@@ -1907,6 +1987,7 @@ static class SessionExtension final : public Extension {
     HHVM_FE(session_id);
     HHVM_FE(session_regenerate_id);
     HHVM_FE(session_encode);
+    HHVM_FE(multi_session_encode); //cheng-hack
     HHVM_FE(session_decode);
     HHVM_FE(session_start);
     HHVM_FE(session_destroy);

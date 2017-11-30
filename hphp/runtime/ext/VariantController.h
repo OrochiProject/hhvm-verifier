@@ -48,6 +48,8 @@ struct VariantController {
       case KindOfRef:
         throw HPHP::serialize::SerializeError(
           "don't know how to serialize HPHP Variant");
+      // TODO(cheng): need a implementation here
+      case KindOfMulti:
       case KindOfClass:
         break;
     }

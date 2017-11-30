@@ -141,6 +141,7 @@ public:
       case DataType::KindOfUninit:
       case DataType::KindOfRef:
       case DataType::KindOfClass:
+      case DataType::KindOfMulti:
         return unknown;
     }
     not_reached();

@@ -16,6 +16,7 @@
 */
 
 #include "hphp/runtime/ext/array/ext_array.h"
+#include "hphp/runtime/ext/std/ext_std_variable.h"
 
 #include "hphp/runtime/base/array-data-defs.h"
 #include "hphp/runtime/base/array-init.h"
@@ -297,9 +298,10 @@ Variant HHVM_FUNCTION(array_flip,
   return ret.toVariant();
 }
 
-bool HHVM_FUNCTION(array_key_exists,
-                   const Variant& key,
-                   const Variant& search) {
+
+// cheng-hack:
+// the original array_key_exists
+bool _array_key_exists(const Variant& key, const Variant& search) {
   const ArrayData *ad;
 
   auto const searchCell = search.asCell();
@@ -345,10 +347,37 @@ bool HHVM_FUNCTION(array_key_exists,
       return false;
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
   not_reached();
+}
+
+bool HHVM_FUNCTION(array_key_exists,
+                   const Variant& key,
+                   const Variant& search) {
+
+  cheng_assert(key.m_type != KindOfMulti);
+
+  // cheng-hack: add multivalue support
+  if (search.m_type == KindOfMulti) {
+    bool is_firtst = true;
+    bool ret = true;
+
+    for (auto it : *search.m_data.pmulti) {
+      if (is_firtst) {
+        is_firtst = false;
+        ret = _array_key_exists(key, tvAsVariant(it));
+      } else {
+        cheng_assert(_array_key_exists(key, tvAsVariant(it)) == ret);
+      }
+    }
+
+    return ret;
+  } else {
+    return _array_key_exists(key, search);
+  }
 }
 
 bool HHVM_FUNCTION(key_exists,
@@ -661,6 +690,7 @@ Variant HHVM_FUNCTION(array_product,
       case KindOfResource:
         continue;
 
+      case KindOfMulti:
       case KindOfClass:
         break;
     }
@@ -683,12 +713,47 @@ DOUBLE:
       case KindOfResource:
         continue;
 
+      case KindOfMulti:
       case KindOfClass:
         break;
     }
     not_reached();
   }
   return d;
+}
+
+// cheng-hack: this is only used for $_SERVER
+void HHVM_FUNCTION(array_set_multi,
+                      VRefParam container,
+                      const Variant& key,
+                      const Variant& multi_val) {
+  // check the args
+  //HHVM_FN(print_r)(multi_val);
+  //always_assert(multi_val.m_type == KindOfMulti);
+  always_assert(key.m_type == KindOfStaticString || key.m_type == KindOfString || key.m_type == KindOfInt64);
+  always_assert(container->isArray());
+
+  // 
+  auto const array_cell = container.wrapped().asCell();
+  always_assert(array_cell->m_type == KindOfArray);
+  Array& arr_array = *reinterpret_cast<Array*>(&array_cell->m_data.parr);
+  arr_array = arr_array->set(key, multi_val, false);
+  arr_array->setWithMulti(ArrayData::arrayWithMulti); // should be true?
+  //std::cout << "current array: " << (void*)array_cell->m_data.parr << "\n";
+}
+
+Variant HHVM_FUNCTION(array_sys_unset, Variant container) {
+  always_assert(container.isArray());
+
+  Array& arr_array = container.asArrRef();
+  arr_array->setWithMulti(false);
+  // check if there is multivalue inside
+  if (MultiVal::containMultiVal(container.asTypedValue())) {
+    TypedValue tmp_arr = *container.asTypedValue(); 
+    TypedValue new_arr = MultiVal::transferArray(tmp_arr);
+    container = tvAsVariant(&new_arr);
+  }
+  return container;
 }
 
 Variant HHVM_FUNCTION(array_push,
@@ -946,6 +1011,7 @@ Variant HHVM_FUNCTION(array_sum,
       case KindOfResource:
         continue;
 
+      case KindOfMulti:
       case KindOfClass:
         break;
     }
@@ -969,6 +1035,7 @@ DOUBLE:
         continue;
 
       case KindOfClass:
+      case KindOfMulti:
         break;
     }
     not_reached();
@@ -1229,6 +1296,7 @@ int64_t HHVM_FUNCTION(count,
       return 1;
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -1243,12 +1311,44 @@ int64_t HHVM_FUNCTION(sizeof,
 
 namespace {
 
+  // cheng-hack: fix "current" call
 enum class NoCow {};
 template<class DoCow = void, class NonArrayRet, class OpPtr>
 static Variant iter_op_impl(VRefParam refParam, OpPtr op, NonArrayRet nonArray,
                             bool(ArrayData::*pred)() const =
                               &ArrayData::isInvalid) {
   auto& cell = *refParam.wrapped().asCell();
+  // cheng-hack:
+  // used to be a BUG: cell can be a ref (why??)
+  if (cell.m_type == KindOfRef) {
+    cell = *tvToCell(&cell);
+  }
+  if (cell.m_type == KindOfMulti) {
+    auto ret_multi = MultiVal::makeMultiVal();
+
+    for (auto it : *cell.m_data.pmulti) {
+      // used to be BUG: we can have a ref instead of array
+      auto elem = tvToCell(it);
+      if (elem->m_type != KindOfArray) {
+        throw_bad_type_exception("expecting an array");
+        return Variant(nonArray);
+      }
+
+      auto ad = elem->m_data.parr;
+      auto constexpr doCow = !std::is_same<DoCow, NoCow>::value;
+      if (doCow && ad->hasMultipleRefs() && !(ad->*pred)() &&
+          !ad->noCopyOnWrite()) {
+        ad = ad->copy();
+        cellSet(make_tv<KindOfArray>(ad), *elem);
+      }
+      auto ret = (ad->*op)();
+      ret_multi.m_data.pmulti->addValue(ret);
+    }
+
+    return tvAsVariant(&ret_multi);
+  }
+
+  // normal case
   if (cell.m_type != KindOfArray) {
     throw_bad_type_exception("expecting an array");
     return Variant(nonArray);
@@ -2691,6 +2791,8 @@ public:
     HHVM_FE(array_pop);
     HHVM_FE(array_product);
     HHVM_FE(array_push);
+    HHVM_FE(array_set_multi); // cheng-hack
+    HHVM_FE(array_sys_unset); // cheng-hack
     HHVM_FE(array_rand);
     HHVM_FE(array_reduce);
     HHVM_FE(array_reverse);

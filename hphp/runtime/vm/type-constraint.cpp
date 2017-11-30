@@ -31,6 +31,7 @@
 #include "hphp/runtime/vm/vm-regs.h"
 
 #include "hphp/runtime/ext/std/ext_std_function.h"
+#include "hphp/runtime/ext/std/ext_std_variable.h"
 
 namespace HPHP {
 
@@ -414,6 +415,10 @@ bool TypeConstraint::check(TypedValue* tv, const Func* func) const {
         case KindOfResource:
           continue;
 
+        case KindOfMulti: //cheng-hack: FIXME:don't know if this is correct.
+          always_assert(false);
+          continue;
+
         case KindOfRef:
         case KindOfClass:
           break;
@@ -454,6 +459,7 @@ static const char* describe_actual_type(const TypedValue* tv, bool isHHType) {
     case KindOfResource:      return tv->m_data.pres->o_getClassName().c_str();
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

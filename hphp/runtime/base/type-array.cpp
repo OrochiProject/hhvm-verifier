@@ -529,6 +529,7 @@ const Variant& Array::rvalAtRef(const Variant& key, ACCESSPARAMS_IMPL) const {
     case KindOfRef:
       return rvalAtRef(*(key.asTypedValue()->m_data.pref->var()), flags);
 
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

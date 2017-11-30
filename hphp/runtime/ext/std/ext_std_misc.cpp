@@ -199,7 +199,7 @@ static Class* getClassByName(const char* name, int len) {
     auto ar = cf();
     if (ar) {
       if (ar->hasThis()) {
-        cls = ar->getThis()->getVMClass();
+        cls = ar->getThisDefault()->getVMClass();
       } else if (ar->hasClass()) {
         cls = ar->getClass();
       }

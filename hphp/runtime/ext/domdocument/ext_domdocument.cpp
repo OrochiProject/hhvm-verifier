@@ -3614,7 +3614,7 @@ static TypedValue* dom_load(ActRec* ar, L fn) {
   }
 
   ObjectData* od = ar->hasThis()
-    ? ar->getThis()
+    ? ar->getThisSingle() // cheng-hack: not sure what this is
     : DOMDocument::newInstance().detach();
 
   auto* data = Native::data<DOMDocument>(od);

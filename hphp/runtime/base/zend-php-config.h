@@ -2282,7 +2282,7 @@
 #define ZEND_BROKEN_SPRINTF 0
 
 /* */
-#define ZEND_DEBUG 0
+#define ZEND_DEBUG 1
 
 /* */
 #define ZEND_MM_ALIGNMENT 8

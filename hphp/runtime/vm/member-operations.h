@@ -321,6 +321,7 @@ NEVER_INLINE const TypedValue* ElemSlow(TypedValue& tvScratch,
     case KindOfObject:
       return ElemObject<warn, keyType>(tvRef, base, key);
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -495,6 +496,7 @@ inline TypedValue* ElemD(TypedValue& tvScratch, TypedValue& tvRef,
     case KindOfObject:
       return ElemDObject<reffy, keyType>(tvRef, base, key);
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -572,6 +574,7 @@ inline TypedValue* ElemU(TypedValue& tvScratch, TypedValue& tvRef,
     case KindOfObject:
       return ElemUObject<keyType>(tvRef, base, key);
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -668,6 +671,7 @@ inline TypedValue* NewElem(TypedValue& tvScratch, TypedValue& tvRef,
     case KindOfObject:
       return NewElemObject(tvRef, base);
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -976,6 +980,7 @@ StringData* SetElemSlow(TypedValue* base, key_type<keyType> key, Cell* value) {
       SetElemObject<keyType>(base, key, value);
       return nullptr;
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -1093,6 +1098,7 @@ inline void SetNewElem(TypedValue* base, Cell* value) {
     case KindOfObject:
       return SetNewElemObject(base, value);
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -1185,6 +1191,7 @@ inline TypedValue* SetOpElem(TypedValue& tvScratch, TypedValue& tvRef,
     }
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -1254,6 +1261,7 @@ inline TypedValue* SetOpNewElem(TypedValue& tvScratch, TypedValue& tvRef,
     }
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -1442,6 +1450,7 @@ inline void IncDecElem(
     }
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -1519,6 +1528,7 @@ inline void IncDecNewElem(
     }
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -1623,6 +1633,7 @@ void UnsetElemSlow(TypedValue* base, key_type<keyType> key) {
     }
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -1756,6 +1767,7 @@ bool IssetEmptyElemSlow(TypedValue& tvScratch, TypedValue& tvRef,
                                                   key);
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -1839,6 +1851,11 @@ inline DataType propPre(TypedValue& tvScratch, TypedValue*& result,
     case KindOfObject:
       return KindOfObject;
 
+    case KindOfMulti:
+      // cheng-hack: should never be multiVal, since we should make it single
+      // during cascading indexing
+      always_assert(false);
+      
     case KindOfRef:
     case KindOfClass:
       break;
@@ -1993,6 +2010,7 @@ inline void SetProp(Class* ctx, TypedValue* base, key_type<keyType> key,
       return SetPropObj<keyType>(ctx, base->m_data.pobj, key, val);
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -2074,6 +2092,7 @@ inline TypedValue* SetOpProp(TypedValue& tvScratch, TypedValue& tvRef,
       return SetOpPropObj(tvRef, ctx, op, instanceFromTv(base), key, rhs);
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -2172,6 +2191,7 @@ inline void IncDecProp(
       return IncDecPropObj<setResult>(ctx, op, instanceFromTv(base), key, dest);
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

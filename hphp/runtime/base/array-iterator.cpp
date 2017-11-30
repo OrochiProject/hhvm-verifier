@@ -35,8 +35,13 @@
 #include "hphp/runtime/base/array-iterator-defs.h"
 #include "hphp/runtime/base/apc-local-array-defs.h"
 #include "hphp/runtime/vm/vm-regs.h"
+#include "hphp/runtime/ext/std/ext_std_variable.h"
+
+#include "fstream"
+#include "hphp/runtime/ext/std/ext_std_errorfunc.h"
 
 namespace HPHP {
+extern std::ofstream debug_log;
 
 TRACE_SET_MOD(runtime);
 
@@ -894,6 +899,190 @@ CufIter::~CufIter() {
 
 bool Iter::init(TypedValue* c1) {
   assert(c1->m_type != KindOfRef);
+
+  // cheng-hack:
+  if(UNLIKELY(c1->m_type == KindOfMulti)) {
+    //if (c1->m_data.pmulti->getType() != KindOfArray) {
+    //  auto txt = HHVM_FN(print_r)(tvAsVariant(c1), true);
+    //  std::cout << "{{" << txt.toString().toCppString() << "}}\n";
+    //  std::cout << c1->pretty();
+    //  std::cout << "\n";
+    //  HHVM_FN(debug_print_backtrace)();
+    //}
+
+    // cheng-hack: handle the following cases:
+    // multi_array [ multi_array, multi_array, multi_array]
+    // however, make sure that each ith are the same! by how?
+    if (c1->m_data.pmulti->getType() == KindOfMulti) {
+      // FIXME: should not happen at all.
+      TypedValue sanity_multi = MultiVal::makeMultiVal();
+
+      int counter = 0;
+      for ( auto it : *c1->m_data.pmulti) {
+        // each it is a multivalue
+        auto single = MultiVal::selectIthVal(*it, counter++); 
+
+        // push single to the sanity_multi
+        sanity_multi.m_data.pmulti->addValue(single);
+      }
+
+      // push the sanity_multi back to the original *invalid* multival!
+      // Not change the *pointer* pmulti, change the *content* of pmulti!!!
+      // FIXME: is this OK???? what's the ref?
+      sanity_multi.m_data.pmulti->setRefCount(c1->m_data.pmulti->getCount());
+      *c1->m_data.pmulti = *sanity_multi.m_data.pmulti;
+    }
+
+#ifdef CHENG_CHECK
+    always_assert(c1->m_data.pmulti->valSize() > 0);
+    always_assert(c1->m_data.pmulti->getType() == KindOfArray ||
+                  c1->m_data.pmulti->getType() == KindOfObject);
+    // check each of them hase the same size
+    if (c1->m_data.pmulti->getType() == KindOfArray) {
+      int size = -1;
+      for (auto it : *c1->m_data.pmulti) {
+        // deref first
+        it = tvToCell(it);
+        if (it->m_type != KindOfArray) {
+          std::cout << "current 'it' is " << it->pretty() << "\n"; 
+          cheng_assert(false);
+        }
+        if (size == -1) {
+          size = it->m_data.parr->getSize();
+        } else {
+          if (size != it->m_data.parr->getSize()) {
+            std::cout << "size should be " << size << ", but it is " << it->m_data.parr->getSize() << "\n";
+            cheng_assert(false);
+          }
+        }
+      }
+    } else {
+      // check if all of them are equal in: isCollection/iterableObject
+      bool first = true, isCollection, isIterable;
+      for (auto it : *c1->m_data.pmulti) {
+        always_assert(it->m_type == KindOfObject);
+        if (first) {
+          isCollection = it->m_data.pobj->isCollection();
+          first = false;
+        } else {
+          always_assert(isCollection == it->m_data.pobj->isCollection());
+        }
+      }
+      if (!isCollection) {
+        first = true;
+        for (auto it : *c1->m_data.pmulti) {
+          if (first) {
+            it->m_data.pobj->iterableObject(isIterable);
+            first =false;
+          } else {
+            bool tmp;
+            it->m_data.pobj->iterableObject(tmp);
+            always_assert(tmp == isIterable);
+          }
+        }
+      }
+    }
+#endif
+    
+    // used to be a BUG: if is_multi_iter, then it means this iter-frame
+    // has been used. Need to free.
+    // NOTE: for p1p2p3p4
+    /*
+    // BUGBUGBUG: defer to later
+    if ( magic[0] == 'D' && 
+         magic[1] == 'E' && 
+         magic[2] == 'L' && 
+         magic[3] == 'M' && 
+         magic[4] == 'E') {
+      cheng_assert(is_multi_iter);
+      for (auto it : *m_u.multi_iter) {
+        it.~ArrayIter();
+      }
+      delete m_u.multi_iter;
+      strncpy(magic, "OKOKK", 5);
+    }
+    */
+
+    is_multi_iter = true;
+    if (c1->m_data.pmulti->getType() == KindOfArray) {
+      // for array 
+      // if empty, return false
+      if (c1->m_data.pmulti->getByVal(0)->m_data.parr->empty()) {
+        return false;
+      }
+      m_u.multi_iter = new std::vector<ArrayIter>();
+      for (auto it : *c1->m_data.pmulti) {
+        // used to be a BUG: it might be a ref
+        it = tvToCell(it); 
+        cheng_assert(it->m_type == KindOfArray);
+        auto aiter = ArrayIter(it->m_data.parr);
+        aiter.setIterType(ArrayIter::TypeArray);
+        m_u.multi_iter->push_back(aiter);
+      }
+      strncpy(magic, "DELME", 5);
+    } else if (c1->m_data.pmulti->getType() == KindOfObject) {
+
+      // for obj
+      bool isIterator;
+      auto one_sample = c1->m_data.pmulti->getByVal(0);
+      m_u.multi_iter = new std::vector<ArrayIter>();
+        
+      // isIterator ? ArrayIter::TypeIterator : ArrayIter::TypeArray
+      if (one_sample->m_data.pobj->isCollection()) {
+        isIterator = true;
+        for (auto it : *c1->m_data.pmulti) {
+          auto aiter = ArrayIter(it->m_data.pobj);
+          aiter.setIterType(ArrayIter::TypeIterator);
+          m_u.multi_iter->push_back(aiter);
+        }
+      } else {
+        one_sample->m_data.pobj->iterableObject(isIterator);
+        if (isIterator) {
+          for (auto it : *c1->m_data.pmulti) {
+            Object obj = it->m_data.pobj->iterableObject(isIterator);
+            always_assert(isIterator);
+            auto aiter = ArrayIter(obj.detach(), ArrayIter::noInc);
+            aiter.setIterType(ArrayIter::TypeIterator);
+            m_u.multi_iter->push_back(aiter);
+          }
+        } else {
+          Class* ctx = arGetContextClass(vmfp());
+          auto ctxStr = ctx ? ctx->nameStr() : StrNR();
+
+          for (auto it : *c1->m_data.pmulti) {
+            Object obj = it->m_data.pobj->iterableObject(isIterator);
+            always_assert(!isIterator);
+            Array iterArray(obj->o_toIterArray(ctxStr));
+            ArrayData* ad = iterArray.get();
+            auto aiter = ArrayIter(ad);
+            aiter.setIterType(ArrayIter::TypeArray);
+            m_u.multi_iter->push_back(aiter);
+          }
+        }
+      }
+      strncpy(magic, "DELME", 5);
+
+      // check if empty
+      ArrayIter iter = (*m_u.multi_iter)[0];
+      if (iter.end()) {
+        for (auto it : *m_u.multi_iter) {
+          it.~ArrayIter();
+        }
+        delete m_u.multi_iter;
+        strncpy(magic, "OKOKK", 5);
+        return false;
+      }
+    } else {
+      // should not be here
+      always_assert(false);
+    }
+
+    return true;
+  }
+
+  // cheng-hack: this means iter is not multi-iter
+  is_multi_iter = false;
+
   bool hasElems = true;
   if (c1->m_type == KindOfArray) {
     if (!c1->m_data.parr->empty()) {
@@ -940,9 +1129,53 @@ bool Iter::init(TypedValue* c1) {
   return hasElems;
 }
 
+// cheng-hack:
+TypedValue Iter::arrFirst() {
+  TypedValue multi = MultiVal::makeMultiVal();
+  for (auto &it : *m_u.multi_iter) {
+    multi.m_data.pmulti->addValue(*it.first().asTypedValue());
+  }
+  // multi can be the same
+  auto single = multi.m_data.pmulti->shrinkToSingle();
+  if (single != nullptr) {
+    return tvAsVariant(single);
+  }
+  return multi;
+}
+
+TypedValue Iter::arrSecond() {
+  TypedValue multi = MultiVal::makeMultiVal();
+  for (auto &it : *m_u.multi_iter) {
+    multi.m_data.pmulti->addValue(*it.second().asTypedValue());
+  }
+  // multi can be the same
+  auto single = multi.m_data.pmulti->shrinkToSingle();
+  if (single != nullptr) {
+    //tvDecRefMulti(&multi);
+    return tvAsVariant(single);
+  }
+  return multi;
+}
+
 bool Iter::next() {
   assert(arr().getIterType() == ArrayIter::TypeArray ||
          arr().getIterType() == ArrayIter::TypeIterator);
+
+  // cheng-hack:
+  if (UNLIKELY(is_multi_iter)) {
+    int ret = 0;
+    for (auto &it : *m_u.multi_iter) {
+      it.next();
+
+      if (it.end()) {
+        it.~ArrayIter();
+        if (ret == 0) ret = -1; else always_assert(ret == -1);
+      } else {
+        if (ret == 0) ret = 1; else always_assert(ret == 1);
+      }
+    }
+    return ret==1;
+  }
   // The emitter should never generate bytecode where the iterator
   // is at the end before IterNext is executed. However, even if
   // the iterator is at the end, it is safe to call next().
@@ -961,16 +1194,32 @@ bool Iter::next() {
 }
 
 void Iter::free() {
+  // cheng-hack:
+  if (UNLIKELY(is_multi_iter)) {
+    for (auto &it : *m_u.multi_iter) {
+      it.~ArrayIter();
+    }
+    delete(m_u.multi_iter);
+    return;
+  }
   assert(arr().getIterType() == ArrayIter::TypeArray ||
          arr().getIterType() == ArrayIter::TypeIterator);
   arr().~ArrayIter();
 }
 
 void Iter::mfree() {
+  // cheng-hack:
+#ifdef CHENG_CHECK
+  always_assert(!is_multi_iter);
+#endif
   marr().~MArrayIter();
 }
 
 void Iter::cfree() {
+  // cheng-hack:
+#ifdef CHENG_CHECK
+  always_assert(!is_multi_iter);
+#endif
   cuf().~CufIter();
 }
 

@@ -95,6 +95,7 @@ Variant SSATmp::variantVal() const {
     case KindOfResource:
     case KindOfRef:
     case KindOfClass:
+    case KindOfMulti:
       break;
   }
   not_reached();

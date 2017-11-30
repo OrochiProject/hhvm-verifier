@@ -31,39 +31,41 @@ warning:  Cns "E_USER_WARNING"
 # so we use the fast, php version
 
 one_array:
-          IsTypeL $arr Arr
-          JmpZ call_cpp_impl
-          IssetL $func
-          JmpZ ident
-          CGetL $func
-          DecodeCufIter 0 bad_func
-.try_fault kill_iter_0 {
-            NewLikeArrayL $arr 0
-            SetL $res
-            PopC
-
-            CGetL $arr
-            WIterInitK 1 endloop $v $k
-
-  .try_fault kill_iter_1 1 {
-    loop_x:   FPushCufIter 1 0
-              FPassL 0 $v
-              FCall 1
-              SetWithRefRM <L:$res EL:$k>
-              WIterNextK 1 loop_x $v $k
-  }
-}
-endloop:  CIterFree 0
-          CGetL $res
-          RetC
-
-ident:    CGetL $arr
-          RetC
-
-kill_iter_0:
-          CIterFree 0
-          Unwind
-kill_iter_1:
-          IterFree 1
-          Unwind
+#cheng-hack: always use c++ implementation
+          Jmp call_cpp_impl
+#          IsTypeL $arr Arr
+#          JmpZ call_cpp_impl
+#          IssetL $func
+#          JmpZ ident
+#          CGetL $func
+#          DecodeCufIter 0 bad_func
+#.try_fault kill_iter_0 {
+#            NewLikeArrayL $arr 0
+#            SetL $res
+#            PopC
+#
+#            CGetL $arr
+#            WIterInitK 1 endloop $v $k
+#
+#  .try_fault kill_iter_1 1 {
+#    loop_x:   FPushCufIter 1 0
+#              FPassL 0 $v
+#              FCall 1
+#              SetWithRefRM <L:$res EL:$k>
+#              WIterNextK 1 loop_x $v $k
+#  }
+#}
+#endloop:  CIterFree 0
+#          CGetL $res
+#          RetC
+#
+#ident:    CGetL $arr
+#          RetC
+#
+#kill_iter_0:
+#          CIterFree 0
+#          Unwind
+#kill_iter_1:
+#          IterFree 1
+#          Unwind
 }

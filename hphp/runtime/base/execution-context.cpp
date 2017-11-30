@@ -55,6 +55,8 @@
 #include "hphp/runtime/vm/runtime.h"
 #include "hphp/system/constants.h"
 
+#include <fstream>
+
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -213,7 +215,17 @@ static void safe_stdout(const  void  *ptr,  size_t  size) {
   write(fileno(stdout), ptr, size);
 }
 
+// cheng-hack:
+// keep track to "output ports": writeStdout/m_transport->sendRaw
+extern bool cheng_verification;
+extern thread_local std::stringstream veri_buf;
+
 void ExecutionContext::writeStdout(const char *s, int len) {
+  // cheng-hack:
+  if (cheng_verification) {
+    veri_buf << std::string(s,len);
+  }
+
   if (m_stdout == nullptr) {
     if (s_stdout_color) {
       safe_stdout(s_stdout_color, strlen(s_stdout_color));
@@ -233,6 +245,19 @@ size_t ExecutionContext::getStdoutBytesWritten() const {
 }
 
 void ExecutionContext::write(const char *s, int len) {
+  // cheng-hack:
+  if (m_isMultiObs) {
+    cheng_assert(m_multi_out);
+    // write to each buffers
+    auto iter = m_multi_out->begin();
+    while (iter != m_multi_out->end()) {
+      OutputBuffer &m_buf = *(iter++);
+      StringBuffer &m_sb = m_buf.oss; 
+      m_sb.append(s, len);
+    }
+    //if (m_implicitFlush) flush();
+  } else {
+    // normal case: 
   if (m_sb) {
     m_sb->append(s, len);
     if (m_out && m_out->chunk_size > 0) {
@@ -244,7 +269,336 @@ void ExecutionContext::write(const char *s, int len) {
     writeStdout(s, len);
   }
   if (m_implicitFlush) flush();
+  }
 }
+
+///////////////////////////////////////////////////////////////////////////////
+// cheng-hack:
+// multi output buffers
+extern thread_local int batch_size;
+
+void ExecutionContext::multiObPrepare() {
+  // this initialization only happen once
+  // if m_obExists is true, when multiObEnd, it will flush the output to the ob buffer
+  // otherwise, multi_ob will flush out directly
+  // m_protectedLevel_resv should never change within multi_ob has been used
+  cheng_assert(m_multiInit == false);
+  m_obExists = m_buffers.empty() ? false : true;
+  m_protectedLevel_resv = m_protectedLevel;
+  m_initob_level = m_buffers.size(); 
+  m_multiInit = true;
+}
+
+void ExecutionContext::write_multi(MultiVal* m) {
+  cheng_assert(m->valSize() == batch_size);
+  cheng_assert(m_multi_out);
+
+  auto iter = m_multi_out->begin();
+  int counter = 0;
+  while (iter != m_multi_out->end()) {
+    OutputBuffer &m_buf = *(iter++);
+    StringBuffer &m_sb = m_buf.oss; 
+
+    TypedValue* tv = m->getByVal(counter);
+    auto str = tvAsVariant(tv).toString();
+    m_sb.append(str);
+    counter++;
+  }
+}
+
+void ExecutionContext::multiResetCurrentBuffer() {
+  if (m_multi_buffers.empty()) {
+    m_multi_out = nullptr;
+    // We've no longer had output buffer 
+    m_isMultiObs = false;
+  } else {
+    m_multi_out = &m_multi_buffers.back();
+  }
+}
+
+void ExecutionContext::multiObStart(const Variant& handler, int chunk_size){
+  cheng_assert(m_multiInit);
+  cheng_assert(m_isMultiObs == true);
+  cheng_assert(batch_size > 1);
+
+  if (m_insideOBHandler) {
+    raise_error("ob_start(): Cannot use output buffering "
+                "in output buffering display handlers");
+  }
+
+  m_multi_buffers.emplace_back();
+  smart::list<OutputBuffer> &vec = m_multi_buffers.back();
+  for (int i=0; i<batch_size; i++) {
+    vec.emplace_back(Variant(handler), chunk_size);
+  }
+  multiResetCurrentBuffer();
+}
+
+std::vector<String> ExecutionContext::multiObCopyContents(){
+  std::vector<String> ret;
+
+  if (!m_multi_buffers.empty()) {
+    auto &outbufs = m_multi_buffers.back();
+    cheng_assert(outbufs.size() == batch_size);
+
+    // add each OutputBuffer content to ret
+    auto iter = outbufs.begin();
+    for (int i=0; i<batch_size; i++) {
+      OutputBuffer &outbuf = *(iter++);
+      StringBuffer &oss = outbuf.oss;
+      if (!oss.empty()) {
+        ret.push_back(oss.copy());
+      }
+    }
+    cheng_assert(iter == outbufs.end());
+  } else {
+    for (int i=0; i<batch_size; i++) {
+      ret.push_back(empty_string());
+    }
+  }
+
+  return ret;
+}
+
+std::vector<int> ExecutionContext::multiObGetContentLength(){
+  std::vector<int> ret;
+
+  auto &outbufs = m_multi_buffers.back();
+  auto iter = outbufs.begin();
+  while (iter != outbufs.end()) {
+    OutputBuffer &outbuf = *(iter++);
+    ret.push_back(outbuf.oss.size());
+  }
+  
+  return ret;
+}
+
+void ExecutionContext::multiObClean(int handler_flag){
+  if (!m_multi_buffers.empty()) {
+    auto &outbufs = m_multi_buffers.back();
+    auto iter = outbufs.begin();
+
+    while(iter != outbufs.end()) {
+      OutputBuffer &last = *iter;
+      if (!last.handler.isNull()) {
+        m_insideOBHandler = true;
+        SCOPE_EXIT { m_insideOBHandler = false; };
+        vm_call_user_func(last.handler,
+                          make_packed_array(last.oss.detach(), handler_flag));
+      }
+      last.oss.clear();
+      iter++;
+    }
+  }
+}
+
+bool ExecutionContext::multiObFlush(){
+  cheng_assert(m_protectedLevel >= 0);
+  cheng_assert(m_protectedLevel_resv == m_protectedLevel);
+
+  if ((int)m_multi_buffers.size() <= 0/*m_protectedLevel*/) {
+    return false;
+  }
+
+  auto iter = m_multi_buffers.end();
+  smart::list<OutputBuffer>& last_layer = *(--iter);
+
+  const int flag = k_PHP_OUTPUT_HANDLER_START | k_PHP_OUTPUT_HANDLER_END;
+
+  // If this layer is not the last layer
+  if (iter != m_multi_buffers.begin()) {
+    smart::list<OutputBuffer>& prev_layer = *(--iter);
+    auto prev_ob_iter = prev_layer.begin();
+    auto last_ob_iter = last_layer.begin();
+
+    while (prev_ob_iter != prev_layer.end()) {
+      OutputBuffer &prev = *prev_ob_iter;
+      OutputBuffer &last = *last_ob_iter;
+
+      if (last.handler.isNull()) {
+        prev.oss.absorb(last.oss);
+      } else {
+        auto str = last.oss.detach();
+        try {
+          Variant tout;
+          {
+            m_insideOBHandler = true;
+            SCOPE_EXIT { m_insideOBHandler = false; };
+            tout = vm_call_user_func(
+                                     last.handler, make_packed_array(str, flag)
+                                    );
+          }
+          prev.oss.append(tout.toString());
+        } catch (...) {
+          // FIXME: we stop here
+          cheng_assert(false);
+          prev.oss.append(str);
+          throw;
+        }
+      }
+
+      prev_ob_iter++;
+      last_ob_iter++;
+    }
+
+    return true;
+  }
+
+  // Otherwise, current layer(last_layer) is the final layer
+  // And, we nned to organize the multi-output here
+  std::vector<String> buf_outputs;
+  auto last_ob_iter = last_layer.begin();
+  while (last_ob_iter != last_layer.end()) {
+    OutputBuffer &last = *(last_ob_iter++);
+    auto str = last.oss.detach();
+    if (!last.handler.isNull()) {
+      try {
+        Variant tout;
+        {
+          m_insideOBHandler = true;
+          SCOPE_EXIT { m_insideOBHandler = false; };
+          tout = vm_call_user_func(
+                                   last.handler, make_packed_array(str, flag)
+                                  );
+        }
+        str = tout.toString();
+      } catch (...) {
+        // FIXME: just stop here 
+        cheng_assert(false);
+        writeStdout(str.data(), str.size());
+        throw;
+      }
+    }
+    buf_outputs.push_back(str);
+  }
+
+  // check whether the outputs are the same
+  bool areSame = true;
+  auto first_str = buf_outputs[0];
+  for (auto it : buf_outputs) {
+    if (first_str != it) {
+      areSame = false;
+      break;
+    }
+  }
+
+  // if m_obExists, multi_ob result will flush to that buffer
+  // otherwise, directly flush out
+  if (areSame) {
+    if (m_obExists) {
+      cheng_assert(m_sb);
+      m_sb->append(first_str.data(), first_str.size());
+    } else {
+      writeStdout(first_str.data(), first_str.size());
+    }
+  } else {
+    StringBuffer sb_output;
+    sb_output.append("[{");
+
+    for (auto it : buf_outputs) {
+      sb_output.append(it);
+      sb_output.append("|||");
+    }
+
+    sb_output.append("}]");
+    auto str_output = sb_output.detach();
+    if (m_obExists) {
+      cheng_assert(m_sb);
+      m_sb->append(str_output.data(), str_output.size());
+    } else {
+      writeStdout(str_output.data(), str_output.size());
+    }
+  }
+  return true;
+}
+
+bool ExecutionContext::multiObEnd(){
+  cheng_assert(m_protectedLevel >= 0);
+  cheng_assert(m_protectedLevel_resv == m_protectedLevel);
+
+  if ((int)m_multi_buffers.size() > 0/*m_protectedLevel*/) {
+    m_multi_buffers.pop_back();
+    multiResetCurrentBuffer();
+    //if (m_implicitFlush) flush();
+    return true;
+  }
+  //if (m_implicitFlush) flush();
+
+  return false;
+}
+
+void ExecutionContext::multiObFlushAll(){
+  while (multiObFlush()) { multiObEnd(); }
+}
+
+void ExecutionContext::multiObEndAll(){
+  while (multiObEnd()) {}
+}
+
+int ExecutionContext::multiObGetLevel(){
+  cheng_assert((int)m_buffers.size() >= m_protectedLevel);
+  if (m_protectedLevel_resv != m_protectedLevel) {
+    cheng_assert(false);
+  }
+  return m_multi_buffers.size() + m_buffers.size() - m_protectedLevel;
+}
+
+// moved from obGetStatus
+const StaticString
+  s_level("level"),
+  s_type("type"),
+  s_name("name"),
+  s_args("args"),
+  s_default_output_handler("default output handler");
+
+
+std::vector<Array> ExecutionContext::multiObGetStatus(bool full){
+  cheng_assert(m_protectedLevel_resv == m_protectedLevel);
+  std::vector<Array> ret_vec;
+
+  for (int i=0; i<batch_size; i++) {
+    Array empty = Array::Create();
+    ret_vec.push_back(empty);
+  }
+
+  auto outbuf_iter = m_multi_buffers.begin();
+
+  // loop each level
+  int level = 0;
+  while (outbuf_iter != m_multi_buffers.end()) {
+
+    smart::list<OutputBuffer> &outbufs = *(outbuf_iter++);
+    auto inner_iter = outbufs.begin();
+
+    // loop each multi_ob
+    int ith_elem = 0;
+    while (inner_iter != outbufs.end()) {
+      OutputBuffer &buffer = *(inner_iter++);
+
+      Array status;
+      status.set(s_level, level);
+      if (level < m_protectedLevel) {
+        status.set(s_type, 1);
+        status.set(s_name, s_default_output_handler);
+      } else {
+        status.set(s_type, 0);
+        status.set(s_name, buffer.handler);
+      }
+
+      if (full) {
+        ret_vec[ith_elem].append(status);
+      } else {
+        ret_vec[ith_elem] = std::move(status);
+      }
+      ith_elem++;
+    }
+
+    level++;
+  }
+
+  return ret_vec;
+}
+
 
 ///////////////////////////////////////////////////////////////////////////////
 // output buffers
@@ -259,6 +613,8 @@ void ExecutionContext::obStart(const Variant& handler /* = null */,
     raise_error("ob_start(): Cannot use output buffering "
                 "in output buffering display handlers");
   }
+  // cheng-hack: m_buffers will only be used in single request
+  cheng_assert(batch_size <= 1);
   m_buffers.emplace_back(Variant(handler), chunk_size);
   resetCurrentBuffer();
 }
@@ -367,6 +723,7 @@ void ExecutionContext::obFlushAll() {
 
 bool ExecutionContext::obEnd() {
   assert(m_protectedLevel >= 0);
+
   if ((int)m_buffers.size() > m_protectedLevel) {
     m_buffers.pop_back();
     resetCurrentBuffer();
@@ -385,13 +742,6 @@ int ExecutionContext::obGetLevel() {
   assert((int)m_buffers.size() >= m_protectedLevel);
   return m_buffers.size() - m_protectedLevel;
 }
-
-const StaticString
-  s_level("level"),
-  s_type("type"),
-  s_name("name"),
-  s_args("args"),
-  s_default_output_handler("default output handler");
 
 Array ExecutionContext::obGetStatus(bool full) {
   Array ret = Array::Create();
@@ -441,6 +791,10 @@ void ExecutionContext::flush() {
     if (!oss.empty()) {
       if (m_transport) {
         m_transport->sendRaw((void*)oss.data(), oss.size(), 200, false, true);
+        // cheng-hack:
+        if (cheng_verification) {
+          veri_buf << std::string(oss.data(), oss.size());
+        }
       } else {
         writeStdout(oss.data(), oss.size());
         fflush(stdout);
@@ -584,6 +938,9 @@ void ExecutionContext::executeFunctions(ShutdownType type) {
 void ExecutionContext::onShutdownPreSend() {
   // in case obStart was called without obFlush
   SCOPE_EXIT {
+    if (m_isMultiObs) {
+      try { multiObFlushAll(); } catch (...) {}
+    }
     try { obFlushAll(); } catch (...) {}
   };
 

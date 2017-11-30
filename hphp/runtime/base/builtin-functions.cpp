@@ -147,7 +147,9 @@ vm_decode_function(const Variant& function,
         } else if (sclass.get()->isame(s_static.get())) {
           if (ar) {
             if (ar->hasThis()) {
-              cls = ar->getThis()->getVMClass();
+              // cheng-hack:
+              //cls = ar->getThis()->getVMClass();
+              cls = ar->getThisDefault()->getVMClass();
             } else if (ar->hasClass()) {
               cls = ar->getClass();
             }
@@ -201,7 +203,9 @@ vm_decode_function(const Variant& function,
       } else if (c.get()->isame(s_static.get())) {
         if (ar) {
           if (ar->hasThis()) {
-            cc = ar->getThis()->getVMClass();
+            // cheng-hack:
+            //cc = ar->getThis()->getVMClass();
+            cc = ar->getThisDefault()->getVMClass();
           } else if (ar->hasClass()) {
             cc = ar->getClass();
           }
@@ -254,7 +258,7 @@ vm_decode_function(const Variant& function,
       if (!this_ && ar) {
         // If we did not find a static method AND this_ is null AND there is a
         // frame ar, check if the current instance from ar is compatible
-        ObjectData* obj = ar->hasThis() ? ar->getThis() : nullptr;
+        ObjectData* obj = ar->hasThis() ? ar->getThisSingle() : nullptr;
         if (obj && obj->instanceof(cls)) {
           this_ = obj;
           cls = obj->getVMClass();
@@ -303,7 +307,7 @@ vm_decode_function(const Variant& function,
     // appropriately to propagate the current late bound class.
     if (!this_ && forwarding && ar) {
       HPHP::Class* fwdCls = nullptr;
-      ObjectData* obj = ar->hasThis() ? ar->getThis() : nullptr;
+      ObjectData* obj = ar->hasThis() ? ar->getThisSingle() : nullptr;
       if (obj) {
         fwdCls = obj->getVMClass();
       } else if (ar->hasClass()) {
@@ -518,6 +522,12 @@ Object create_object_only(const String& s) {
 
 Object init_object(const String& s, const Array& params, ObjectData* o) {
   return g_context->initObject(s.get(), params, o);
+}
+
+// cheng-hack:
+sptr< std::vector<ObjectData*> >
+init_object_multi(const String& s, const Array& params, sptr< std::vector<ObjectData*> > o) {
+  return g_context->initObject_multi(s.get(), params, o);
 }
 
 Object create_object(const String& s, const Array& params, bool init /* = true */) {

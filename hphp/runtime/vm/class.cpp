@@ -1876,6 +1876,7 @@ bool Class::compatibleTraitPropInit(TypedValue& tv1, TypedValue& tv2) {
     case KindOfRef:
       return false;
 
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

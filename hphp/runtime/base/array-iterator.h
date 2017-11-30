@@ -25,6 +25,8 @@
 #include "hphp/runtime/base/smart-ptr.h"
 #include "hphp/runtime/base/type-variant.h"
 #include "hphp/util/tls-pod-bag.h"
+#include "hphp/runtime/base/multi-val.h"
+#include <vector>
 
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
@@ -69,7 +71,7 @@ struct ArrayIter {
   enum Type : uint16_t {
     TypeUndefined = 0,
     TypeArray,
-    TypeIterator  // for objects that implement Iterator or
+    TypeIterator,  // for objects that implement Iterator or
                   // IteratorAggregate
   };
 
@@ -377,19 +379,20 @@ private:
   union {
     const ArrayData* m_data;
     ObjectData* m_obj;
+    std::vector<ArrayData*> *m_multi_data;
   };
  public:
   // m_pos is used by the array implementation to track the current position
   // in the array. Beware that when m_data is null, m_pos is uninitialized.
   ssize_t m_pos;
  private:
-  int m_version;
+  int m_version; // FIXME: what is this?
   // This is unioned so new_iter_array can initialize it more
   // efficiently.
   union {
     struct {
       Type m_itype;
-      IterNextIndex m_nextHelperIdx;
+      IterNextIndex m_nextHelperIdx; // FIXME: what is this?
     };
     uint32_t m_itypeAndNextHelperIdx;
   };
@@ -662,13 +665,24 @@ struct Iter {
   void mfree();
   void cfree();
 
+  // cheng-hack:
+  bool isMulti() { return is_multi_iter; }
+  void setMultiVal(bool b) { is_multi_iter=b; }
+  const std::vector<ArrayIter>* multiIter() { return m_u.multi_iter; }
+  TypedValue arrFirst();
+  TypedValue arrSecond();
+
 private:
   union Data {
     Data() {}
     ArrayIter aiter;
     MArrayIter maiter;
     CufIter cufiter;
+    std::vector<ArrayIter>* multi_iter;
   } m_u;
+  bool is_multi_iter;
+public:
+  char magic[5]; // if "DELME" then this data structure need to be clear
 } __attribute__ ((__aligned__(16)));
 
 //////////////////////////////////////////////////////////////////////

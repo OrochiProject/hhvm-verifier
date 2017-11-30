@@ -125,6 +125,10 @@ function mysql_create_db(string $database_name,
 <<__Native>>
 function mysql_data_seek(resource $result,
                          int $row_number): bool;
+// cheng-hack:
+<<__Native>>
+function multi_mysql_data_seek(mixed $result,
+                         mixed $row_number): bool;
 
 /**
  * Retrieves database name from the call to
@@ -243,6 +247,10 @@ function mysql_escape_string(string $unescaped_string): string;
 <<__Native>>
 function mysql_fetch_array(resource $result,
                            int $result_type = MYSQL_BOTH): mixed;
+// cheng-hack:
+<<__Native>>
+function multi_mysql_fetch_array(mixed $result,
+                           mixed $result_type = MYSQL_BOTH): mixed;
 
 /**
  * Fetch a result row as an associative array
@@ -283,6 +291,10 @@ function mysql_fetch_assoc(resource $result): mixed {
 <<__Native>>
 function mysql_fetch_field(resource $result,
                            int $field_offset = -1): mixed;
+// cheng-hack:
+<<__Native>>
+function multi_mysql_fetch_field(mixed $result,
+                           mixed $field_offset = -1): mixed;
 
 /**
  * Get the length of each output in a result
@@ -311,6 +323,11 @@ function mysql_fetch_lengths(resource $result): mixed;
 function mysql_fetch_object(mixed $result,
                             string $class_name = 'stdClass',
                             ?array $params = null): mixed;
+// cheng-hack:
+<<__Native>>
+function multi_mysql_fetch_object(mixed $result,
+                            string $class_name = 'stdClass',
+                            ?mixed $params = null): mixed;
 
 /**
  * Used with mysql_multi_query() to return a mysql result for the current
@@ -396,6 +413,10 @@ function mysql_field_name(resource $result,
 <<__Native>>
 function mysql_field_seek(resource $result,
                           int $field_offset): bool;
+// cheng-hack:
+<<__Native>>
+function multi_mysql_field_seek(mixed $result,
+                          mixed $field_offset): bool;
 
 /**
  * Get name of the table the specified field is in
@@ -434,6 +455,9 @@ function mysql_field_type(resource $result,
  */
 <<__Native>>
 function mysql_free_result(resource $result): bool;
+// cheng-hack:
+<<__Native>>
+function multi_mysql_free_result(mixed $result): bool;
 
 /**
  * Get MySQL client info
@@ -603,6 +627,13 @@ function mysql_more_results(?resource $link_identifier = NULL): bool;
 <<__Native, __HipHopSpecific>>
 function mysql_multi_query(string $query,
                            ?resource $link_identifier = NULL): mixed;
+// cheng-hack:
+<<__Native>>
+function ttdb_multi_query(mixed $query, mixed $rid, int $opnum, int $query_num, mixed $link): mixed;
+<<__Native>>
+function ttdb_query(mixed $query, mixed $req_no, int $opnum, int $query_num, mixed $link): mixed;
+<<__Native>>
+function ttdb_query_mysqli_result(mixed $query, mixed $req_no, int $opnum, int $query_num, mixed $link): mixed;
 
 /**
  * Used with mysql_multi_query() to move the result set on one.

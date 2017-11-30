@@ -26,8 +26,16 @@
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/runtime/server/http-protocol.h"
 
+#include "hphp/runtime/base/multi-val.h"
+#include "hphp/runtime/ext/std/sql-parser.h"
+#include "hphp/runtime/vm/yastopwatch.h"
+
+#include "fstream"
+#include "vector"
+
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
+
 
 const StaticString
   s_unknown_type("unknown type"),
@@ -125,7 +133,448 @@ bool HHVM_FUNCTION(is_resource, const Variant& v) {
 }
 
 ///////////////////////////////////////////////////////////////////////////////
+// cheng-hack: Multi-value APIs
+
+extern bool should_count;
+void HHVM_FUNCTION(set_should_count, bool count) {
+  should_count = count;
+}
+
+static Variant
+makeMultiVal(int size=0) {
+  Variant v;
+  v.m_type = KindOfMulti;
+  v.m_data.pmulti = new MultiVal(size); 
+  return v;
+}
+
+extern thread_local bool loop_capture_mode;
+extern thread_local std::vector<TypedValue> finish_loop_var;
+extern thread_local std::vector<TypedValue> finish_capture_var;
+extern thread_local std::vector<int> loop_alive;
+extern thread_local TypedValue origin_loop_var_ref;
+extern thread_local TypedValue origin_capture_var_ref;
+
+void HHVM_FUNCTION(loop_var_capture, VRefParam loop_var_ref, VRefParam capture_var_ref, int64_t size) {
+  loop_capture_mode = true;
+
+  // initialize the ds
+  TypedValue uninit_tv;
+  uninit_tv.m_type = KindOfUninit;
+
+  loop_alive.resize(size);
+  finish_loop_var.resize(size);
+  finish_capture_var.resize(size);
+
+  for(int i=0; i<size; i++) {
+    loop_alive[i] = 1;
+    finish_loop_var[i] = uninit_tv;
+    finish_capture_var[i] = uninit_tv;
+  }
+
+  // copy the ref 
+  refDup(loop_var_ref.wrapped(), origin_loop_var_ref);
+
+  // FIXME: obj may have side-effect after the capture end
+  // we do not earse the element from capture_var after its end
+  cheng_assert(capture_var_ref.wrapped().m_type != KindOfObject);
+  // point to the same MultiVal object
+  refDup(capture_var_ref.wrapped(), origin_capture_var_ref);
+}
+
+void HHVM_FUNCTION(loop_var_end, VRefParam loop_var_ref, VRefParam capture_var_ref) {
+  cheng_assert(loop_var_ref.isReferenced());
+  cheng_assert(capture_var_ref.isReferenced());
+
+  // check if in capture mode
+  if (loop_capture_mode) {
+    // check: loop_alive should be all zero
+    for (auto it : loop_alive) {
+      cheng_assert(it == 0);
+    }
+    // check: finished loop and capture should be full 
+    for (int i=0; i<finish_loop_var.size(); i++) {
+      cheng_assert(finish_loop_var[i].m_type != KindOfUninit);
+      cheng_assert(finish_capture_var[i].m_type != KindOfUninit);
+    }
+
+    int size = finish_loop_var.size();
+
+    auto ret_loop_var = makeMultiVal();
+    auto ret_capture_var = makeMultiVal();
+    // recover the correct result from finish_loop_var/finish_capture_var
+    for (int i=0; i<size; i++) {
+      ret_loop_var.m_data.pmulti->addValue(finish_loop_var[i]);
+      ret_capture_var.m_data.pmulti->addValue(finish_capture_var[i]);
+    }
+    
+    // put the result back to program
+    ret_loop_var.m_data.pmulti->valid();
+    ret_capture_var.m_data.pmulti->valid();
+    
+    // shrink and assign the output
+    auto single = ret_loop_var.m_data.pmulti->shrinkToSingle();
+    if (single == nullptr) {
+      loop_var_ref = tvAsVariant(&ret_loop_var);
+    } else {
+      loop_var_ref = tvAsVariant(single);
+    }
+
+    single = ret_capture_var.m_data.pmulti->shrinkToSingle();
+    if (single == nullptr) {
+      capture_var_ref = tvAsVariant(&ret_capture_var);
+    } else {
+      capture_var_ref = tvAsVariant(single);
+    }
+
+    loop_capture_mode = false;
+  }
+}
+
+// cheng-hack:
+extern thread_local bool is_resource_req; 
+bool HHVM_FUNCTION(is_res_req) {
+  return is_resource_req;
+}
+
+void HHVM_FUNCTION(set_res_req, bool is_res) {
+  is_resource_req = is_res;
+}
+
+// cheng-hack: set the batch_size
+extern thread_local int batch_size; 
+int HHVM_FUNCTION(get_batch_size) {
+  return batch_size;
+}
+
+void HHVM_FUNCTION(set_batch_size, int size) {
+  batch_size = size;
+}
+
+// cheng-hack: the instruction related profiling 
+
+extern thread_local int ins_counter;
+extern thread_local int64_t multi_ins_counter;
+int HHVM_FUNCTION(get_ins_counter) {
+  return ins_counter;
+}
+
+int HHVM_FUNCTION(get_multi_ins_counter) {
+  return multi_ins_counter;
+}
+
+extern thread_local int oparr_ins_counter;
+extern thread_local int oparith_ins_counter;
+extern thread_local int opcf_ins_counter;
+extern thread_local int opget_ins_counter;
+extern thread_local int opset_ins_counter;
+extern thread_local int opisset_ins_counter;
+extern thread_local int opcall_ins_counter;
+extern thread_local int opmember_ins_counter;
+extern thread_local int opiter_ins_counter;
+extern thread_local int opmisc_ins_counter;
+// defined later
+static inline ArrayData* SetNewElemArray(ArrayData* a, TypedValue* value);
+
+Variant HHVM_FUNCTION(get_classified_ins_counter) {
+  // return an array
+  ArrayData* array = staticEmptyArray();
+  array = SetNewElemArray(array, Variant(oparr_ins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(oparith_ins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opcf_ins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opget_ins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opset_ins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opisset_ins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opcall_ins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opmember_ins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opiter_ins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opmisc_ins_counter).asTypedValue());
+  return array;
+}
+
+extern thread_local int oparr_mins_counter;
+extern thread_local int oparith_mins_counter;
+extern thread_local int opcf_mins_counter;
+extern thread_local int opget_mins_counter;
+extern thread_local int opset_mins_counter;
+extern thread_local int opisset_mins_counter;
+extern thread_local int opcall_mins_counter;
+extern thread_local int opmember_mins_counter;
+extern thread_local int opiter_mins_counter;
+extern thread_local int opmisc_mins_counter;
+
+Variant HHVM_FUNCTION(get_classified_mins_counter) {
+  // return an array
+  ArrayData* array = staticEmptyArray();
+  array = SetNewElemArray(array, Variant(oparr_mins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(oparith_mins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opcf_mins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opget_mins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opset_mins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opisset_mins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opcall_mins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opmember_mins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opiter_mins_counter).asTypedValue());
+  array = SetNewElemArray(array, Variant(opmisc_mins_counter).asTypedValue());
+  return array;
+}
+
+extern bool cheng_verification;
+extern thread_local std::stringstream veri_buf;
+void HHVM_FUNCTION(replay_dump_output, const Variant& v) {
+  if (is_resource_req) return;
+  if (cheng_verification) {
+
+
+    // If there are other contents within ob buffer, append to the
+    // veri_buf output
+    if (g_context->obGetContentLength() != 0) {
+      auto content = g_context->obCopyContents();
+      veri_buf << content.toCppString();
+    }
+
+    std::ofstream of;
+    of.open(v.toCStrRef().toCppString());
+    of << veri_buf.str();
+    of.close();
+  }
+}
+
+void HHVM_FUNCTION(veri_dump_output, const Variant& path, const Variant& req_no) {
+  always_assert(req_no.m_type == KindOfMulti);
+  if (is_resource_req) return;
+  if (cheng_verification) {
+
+    if (veri_buf.str() == "") {
+      // FIXME:
+      if (g_context->m_isMultiObs) {
+        g_context->multiObFlushAll();
+      }
+      auto content = g_context->obCopyContents();
+      veri_buf << content.toCppString();
+    }
+
+    std::ofstream of;
+    of.open(path.toCStrRef().toCppString());
+    // first write the batched request id 
+    of << "[";
+    for (auto it : *req_no.m_data.pmulti) {
+      of << it->m_data.num << ",";
+    }
+    of << "]\n";
+    of << veri_buf.str();
+    of.close();
+  }
+}
+
+bool HHVM_FUNCTION(is_verify) {
+  return cheng_verification;
+}
+
+// cheng-hack: session thing
+extern std::string _sess_get_last_write(int64_t rid, int64_t opnum, std::string sess_id);
+extern std::string _sess_get_id(int64_t rid, int64_t opnum, bool check);
+
+Variant HHVM_FUNCTION(sess_get_last_write, const int64_t rid, const int64_t opnum, const Variant& sess_id) {
+  std::string sid = std::string(sess_id.toString().data());
+  return _sess_get_last_write(rid, opnum, sid); 
+}
+
+Variant HHVM_FUNCTION(sess_get_id, const int64_t rid, const int64_t opnum, bool check) {
+  return _sess_get_id(rid, opnum, check); 
+}
+
+Variant HHVM_FUNCTION(add_multi, Variant var, Variant value, int64_t req_num) {
+  if (var.m_type == KindOfMulti) {
+    MultiVal* mv = var.getMultiVal();
+    mv->addValue(value);
+  } else if (var.m_type == KindOfNull || var.m_type == KindOfUninit) {
+    var = makeMultiVal();
+    var.getMultiVal()->addValue(value);
+  } else {
+    std::cout << "ERROR: Cannot add a value to a non-multi-value variable!\n";
+    always_assert(false);
+  }
+  return var;
+}
+
+
+// for break-even eval
+extern void set_batch_upperbound(int64_t bound);
+extern int64_t get_batch_upperbound();
+
+void HHVM_FUNCTION(set_batch_upper_bound, int64_t size) {
+  set_batch_upperbound(size);
+}
+
+// The inputs is an array of values with same type
+Variant HHVM_FUNCTION(gen_multi, const Array& arr) {
+  auto multi_ret = makeMultiVal();
+
+  bool first = true;
+  DataType type;
+  int64_t batch_size = 0;
+  for (ArrayIter iter(arr); iter; ++iter) {
+    if (first) {
+      type = iter.nvSecond()->m_type;
+      first = false;
+    }
+    cheng_assert( (type == iter.nvSecond()->m_type) ||
+                  (type == KindOfInt64 && iter.nvSecond()->m_type == KindOfDouble) ||
+                  (type == KindOfDouble && iter.nvSecond()->m_type == KindOfInt64) );
+
+    multi_ret.m_data.pmulti->addValue(*iter.nvSecond());
+
+    // NOTE: we do batch_upperbound check here
+    // This should only be used for break-even eval
+    if (++batch_size >= get_batch_upperbound()) break;
+  }
+
+  return multi_ret;
+}
+
+bool HHVM_FUNCTION(is_multi, const Variant& value) {
+  if (value.m_type == KindOfMulti) {
+    return true;
+  } else {
+    return (MultiVal::containMultiVal((TypedValue*)value.asTypedValue()) != 0);
+  }
+}
+
+/**
+ * cheng: Borrow from member-operations.h
+ * SetNewElem when base is an Array
+ */
+static inline ArrayData* SetNewElemArray(ArrayData* a, TypedValue* value) {
+  //ArrayData* a = base->m_data.parr;
+  bool copy = (a->hasMultipleRefs())
+    || (value->m_type == KindOfArray && value->m_data.parr == a);
+  ArrayData* a2 = a->append(cellAsCVarRef(*value), copy);
+  if (a2 != a) {
+    a2->incRefCount();
+    a->decRefAndRelease();
+  }
+  return a2;
+}
+
+Variant HHVM_FUNCTION(split_multi, const Variant& value) {
+  always_assert(value.m_type == KindOfMulti);
+
+  ArrayData* array = staticEmptyArray();
+  int req_num = value.m_data.pmulti->valSize();
+  for (int i = 0; i < req_num; i++) {
+    auto it = value.m_data.pmulti->getByVal(i);
+    array = SetNewElemArray(array, it);
+  }
+  return array;
+}
+
+Variant HHVM_FUNCTION(getIthVal, const Variant& value, int64_t i) {
+  cheng_assert(value.m_type == KindOfMulti || MultiVal::containMultiVal((TypedValue*)value.asTypedValue())!=0);
+  auto tv = MultiVal::selectIthVal(value, i);
+  return tvAsVariant(&tv);
+}
+
+Variant HHVM_FUNCTION(merge_multi, const Variant& value) {
+  if (value.m_type == KindOfMulti) {
+    TypedValue *shrink = value.m_data.pmulti->shrinkToSingle();
+    if (shrink == nullptr) {
+      return value;
+    }
+    return tvAsVariant(shrink);
+  } else {
+    // FIXME: can be MIC
+    return value; 
+  }
+}
+
+//==============================
+
+
+
+extern struct __stopwatch__ __SW(db_trans_time);
+extern enum __stopwatch__source__ __SOURCE(db_trans_time); 
+extern enum __stopwatch__type__ __TYPE(db_trans_time);
+
+// cheng-hack:
+#define MAX_IN_TXN 10000
+// defined in bytecode.cpp
+extern int search_opmap(int rid, int opnum, int type);
+
+Variant HHVM_FUNCTION(rewrite_select_sql, const Variant& sql, int64_t rid, int64_t opnum, int64_t query_num) {
+  always_assert(sql.m_type == KindOfStaticString || sql.m_type == KindOfString);
+  
+  std::string str_sql = std::string(sql.toString().data());
+  int64_t seqnum = search_opmap(rid, opnum, SQL_READ); 
+  int64_t timestamp = seqnum * MAX_IN_TXN + query_num; 
+  START_SW(db_trans_time);
+  std::string ret = rewriteOptSelect(str_sql, timestamp);
+  STOP_SW(db_trans_time);
+  return Variant(ret);
+}
+
+Variant HHVM_FUNCTION(MC_to_MIC, const Variant& multi) {
+  always_assert(multi.m_type == KindOfMulti);
+  
+  TypedValue ret;
+  if (multi.m_data.pmulti->getType() == KindOfArray) {
+    ret = MultiVal::invertTransferArray(multi); 
+  } else if (multi.m_data.pmulti->getType() == KindOfObject) {
+    ret = MultiVal::invertTransferObj(multi);
+  } else {
+    always_assert(false);
+  }
+  return tvAsVariant(&ret);
+}
+
+bool HHVM_FUNCTION(check_write_sql, const Variant& sql, int64_t rid, int64_t opnum) {
+  search_opmap(rid, opnum, SQL_WRITE);
+  return true;
+}
+
+int HHVM_FUNCTION(get_seqnum_from_opmap, int64_t rid, int64_t opnum) {
+  // ignore the type check, we just want to know the seqnum
+  return search_opmap(rid, opnum, TYPE_NONE);
+}
+
+
+extern thread_local bool single_mode_on; 
+bool HHVM_FUNCTION(is_single_mode_on) {
+  return single_mode_on;
+}
+
+Variant HHVM_FUNCTION(MIC_to_MC, const Variant& container) {
+  always_assert(container.m_type == KindOfArray || container.m_type == KindOfObject);
+  always_assert(MultiVal::containMultiVal((TypedValue*)container.asTypedValue()) != 0);
+
+  TypedValue ret;
+  if (container.m_type == KindOfArray) {
+    ret = MultiVal::transferArray(container);
+  } else {
+    ret = MultiVal::transferObj(container);
+  }
+  return tvAsVariant(&ret);
+}
+
+extern bool check_maxop(int rid,  int last_op_num);
+bool HHVM_FUNCTION(check_maxop, int64_t rid, int64_t last_op_num) {
+  return check_maxop(rid, last_op_num);
+}
+
+///////////////////////////////////////////////////////////////////////////////
 // input/output
+// cheng-hack:
+Variant HHVM_FUNCTION(print_p, const Variant& expression) {
+  return MultiVal::dumpElem((TypedValue*)expression.asTypedValue());
+  //auto pretty = expression.pretty();
+  //auto isMulti = MultiVal::containMultiVal((TypedValue*)expression.asTypedValue());
+  //std::stringstream ss;
+  //ss << "[" << isMulti << "] " << pretty;
+  //if (expression.m_type == KindOfMulti) {
+  //  ss << " type: " << expression.m_data.pmulti->getType();
+  //}
+  //return ss.str();
+}
 
 Variant HHVM_FUNCTION(print_r, const Variant& expression,
                                bool ret /* = false */) {
@@ -225,6 +674,7 @@ String HHVM_FUNCTION(serialize, const Variant& value) {
       return vs.serialize(value, true);
     }
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -348,6 +798,29 @@ int64_t extract_impl(VRefParam vref_array,
   bool reference = extract_type & EXTR_REFS;
   extract_type &= ~EXTR_REFS;
 
+  // cheng-hack:
+  if (tvToCell(vref_array.wrapped().asTypedValue())->m_type == KindOfMulti) {
+    auto arr = tvToCell(vref_array.wrapped().asTypedValue());
+    cheng_assert(arr->m_data.pmulti->getType() == KindOfArray);
+    // TODO: only support SKIP/OVERWRITE
+    cheng_assert(!reference);
+
+    VMRegAnchor _;
+    auto const varEnv = g_context->getVarEnv();
+    if (!varEnv) return 0;
+
+    auto new_arr = MultiVal::invertTransferArray(*arr);
+    auto var_array = new_arr.m_data.parr;
+    int count = 0;
+    for (ArrayIter iter(var_array); iter; ++iter) {
+      String name = iter.first();
+      if (!modify_extract_name(varEnv, name, extract_type, prefix)) continue;
+      g_context->setVar(name.get(), iter.secondRef().asTypedValue());
+      ++count;
+    }
+    return count;
+  }
+
   if (!vref_array.wrapped().isArray()) {
     raise_warning("extract() expects parameter 1 to be array");
     return 0;
@@ -446,6 +919,36 @@ void StandardExtension::initVariable() {
   HHVM_FE(is_array);
   HHVM_FE(is_object);
   HHVM_FE(is_resource);
+  HHVM_FE(add_multi);    // cheng-hack
+  HHVM_FE(gen_multi);    // cheng-hack
+  HHVM_FE(set_batch_upper_bound);    // cheng-hack
+  HHVM_FE(is_multi);     // cheng-hack
+  HHVM_FE(split_multi);  // cheng-hack
+  HHVM_FE(getIthVal);  // cheng-hack
+  HHVM_FE(merge_multi);  // cheng-hack
+  HHVM_FE(rewrite_select_sql);  // cheng-hack
+  HHVM_FE(check_write_sql);  // cheng-hack
+  HHVM_FE(get_seqnum_from_opmap);  // cheng-hack
+  HHVM_FE(is_verify);  // cheng-hack
+  HHVM_FE(is_single_mode_on);  // cheng-hack
+  HHVM_FE(is_res_req);  // cheng-hack
+  HHVM_FE(set_res_req);  // cheng-hack
+  HHVM_FE(get_batch_size);  // cheng-hack
+  HHVM_FE(set_batch_size);  // cheng-hack
+  HHVM_FE(get_ins_counter);  // cheng-hack
+  HHVM_FE(get_multi_ins_counter);  // cheng-hack
+  HHVM_FE(get_classified_ins_counter);  // cheng-hack
+  HHVM_FE(get_classified_mins_counter);  // cheng-hack
+  HHVM_FE(set_should_count);  // cheng-hack
+  HHVM_FE(replay_dump_output);  // cheng-hack
+  HHVM_FE(veri_dump_output);  // cheng-hack
+  HHVM_FE(loop_var_capture);  // cheng-hack
+  HHVM_FE(loop_var_end);  // cheng-hack
+  HHVM_FE(MIC_to_MC);  // cheng-hack
+  HHVM_FE(MC_to_MIC);  // cheng-hack
+  HHVM_FE(check_maxop);  // cheng-hack
+  HHVM_FE(sess_get_last_write);  // cheng-hack
+  HHVM_FE(sess_get_id);  // cheng-hack
   HHVM_FE(boolval);
   HHVM_FE(intval);
   HHVM_FE(floatval);
@@ -455,6 +958,7 @@ void StandardExtension::initVariable() {
   HHVM_FE(get_resource_type);
   HHVM_FE(settype);
   HHVM_FE(print_r);
+  HHVM_FE(print_p); // cheng-hack
   HHVM_FE(var_export);
   HHVM_FE(debug_zval_dump);
   HHVM_FE(var_dump);

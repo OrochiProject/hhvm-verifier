@@ -1192,6 +1192,8 @@ std::string get_right_option_name(const basic_parsed_options<char>& opts,
 }
 #endif
 
+// cheng-hack:
+extern bool cheng_verification;
 static int execute_program_impl(int argc, char** argv) {
   string usage = "Usage:\n\n   ";
   usage += argv[0];
@@ -1322,6 +1324,15 @@ static int execute_program_impl(int argc, char** argv) {
       if (po.mode == "d") po.mode = "debug";
       if (po.mode == "s") po.mode = "server";
       if (po.mode == "t") po.mode = "translate";
+      // cheng-hack:
+      if (po.mode == "v") {
+        cheng_verification = true;
+        po.mode = "run";
+      }
+      if (po.mode == "daemon-verification") {
+        cheng_verification = true;
+        po.mode = "daemon";
+      }
       if (po.mode == "")  po.mode = "run";
       if (po.mode == "daemon" || po.mode == "server" || po.mode == "replay" ||
           po.mode == "run" || po.mode == "debug"|| po.mode == "translate") {
@@ -1897,6 +1908,9 @@ bool hphp_invoke(ExecutionContext *context, const std::string &cmd,
                  bool &error, string &errorMsg,
                  bool once, bool warmupOnly,
                  bool richErrorMsg) {
+  // cheng-hack: prepare the multi_obs
+  context->multiObPrepare();
+
   bool isServer = RuntimeOption::ServerExecutionMode();
   error = false;
 

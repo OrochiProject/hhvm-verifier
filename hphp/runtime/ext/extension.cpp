@@ -447,6 +447,7 @@ static const char *argTypeName(DataType dt) {
     case KindOfArray:         return "array";
     case KindOfObject:        return "object";
     case KindOfResource:      return "resource";
+    case KindOfMulti:         return "multi";
 
     case KindOfUninit:
     case KindOfRef:

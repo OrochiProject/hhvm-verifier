@@ -111,6 +111,12 @@ Variant HHVM_FUNCTION(array_push,
                       VRefParam container,
                       const Variant& var,
                       const Array& args = null_array);
+void HHVM_FUNCTION(array_set_multi,
+                      VRefParam container,
+                      const Variant& key,
+                      const Variant& multi_val);
+Variant HHVM_FUNCTION(array_sys_unset,
+                      Variant container);
 Variant HHVM_FUNCTION(array_rand,
                       const Variant& input,
                       int num_req = 1);

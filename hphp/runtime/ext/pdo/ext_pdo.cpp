@@ -2633,6 +2633,7 @@ safe:
                 }
                 continue;
 
+              case KindOfMulti:
               case KindOfClass:
                 break;
             }

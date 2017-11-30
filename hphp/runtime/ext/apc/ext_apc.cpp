@@ -199,6 +199,14 @@ void apcExtension::moduleInit() {
   HHVM_FE(apc_exists);
   HHVM_FE(apc_cache_info);
   HHVM_FE(apc_sma_info);
+  // cheng-hack:
+  HHVM_FE(oro_apc_inc_check);
+  HHVM_FE(oro_apc_dec_check);
+  HHVM_FE(oro_apc_store_check);
+  HHVM_FE(oro_apc_fetch_check);
+  HHVM_FE(oro_apc_delete_check);
+  HHVM_FE(set_site_root);
+  HHVM_FE(gen_site_root_placeholder);
   loadSystemlib();
 }
 
@@ -240,6 +248,207 @@ bool apcExtension::Stat = true;
 bool apcExtension::EnableCLI = true;
 
 static apcExtension s_apc_extension;
+
+//=========cheng-hack: tt_apc================
+
+extern bool apc_log_loaded;
+extern bool search_tt_apc_log(std::string key, int64_t rid, int64_t opnum, std::string &result);
+extern bool match_apc_op(std::string key, int64_t rid, int64_t opnum, std::string value, int type, bool& is_failure);
+
+// absolute path problem:
+extern std::string site_root;
+static std::string root_symbol = "#SITE_ROOT#";
+static int root_symbol_len = 11;
+
+void HHVM_FUNCTION(set_site_root, const String& root) {
+  site_root = root.toCppString();
+}
+
+String HHVM_FUNCTION(gen_site_root_placeholder, const int len) {
+  cheng_assert(len >= root_symbol_len); 
+  std::string ret = root_symbol + std::string(len-root_symbol_len, '#');
+  return String(ret.c_str());
+}
+
+Variant HHVM_FUNCTION(oro_apc_store_check,
+                      const Variant& key,
+                      const Variant& var /* = null */,
+                      const Variant req_no /* = 0 */,
+                      const int64_t op_num) {
+  cheng_assert(apc_log_loaded);
+  //cheng_assert(key.m_type != KindOfMulti);
+  //cheng_assert(var.m_type != KindOfMulti);
+
+
+  bool multi = (req_no.m_type == KindOfMulti);
+  bool is_var_multi = (var.m_type == KindOfMulti);
+  //bool is_var_multi = (MultiVal::containMultiVal((TypedValue*)var.asTypedValue()) != 0);
+  bool multi_key = (key.m_type == KindOfMulti); // ASSUMPTION: we cannot get single var with multi-val here
+
+  if (multi) {
+    int counter = 0;
+    for (auto it : *req_no.m_data.pmulti) {
+      std::string str_var, key_str;
+      if (is_var_multi) {
+        auto val = var.m_data.pmulti->getByVal(counter);
+        str_var = tvAsVariant(val).toString().toCppString();
+      } else {
+        str_var = var.toString().toCppString();
+      }
+
+      if (multi_key) {
+        key_str = tvAsVariant(key.m_data.pmulti->getByVal(counter)).toString().toCppString();
+      } else {
+        key_str = key.toString().toCppString();
+      }
+      cheng_assert(it->m_type == KindOfInt64);
+      int64_t rid = it->m_data.num;
+      bool is_failure; // ignore for now
+      bool isvalid = match_apc_op(key_str, rid, op_num, str_var, 6/*KV_SET*/, is_failure);
+      cheng_assert(isvalid);
+      counter++;
+    }
+  } else {
+    cheng_assert(!is_var_multi && !multi_key);
+    auto key_str = key.toString().toCppString();
+    std::string str_var = var.toString().toCppString();
+
+    int64_t rid = req_no.toInt64Val();
+    bool is_failure; // ignore for now
+    bool isvalid = match_apc_op(key_str, rid, op_num, str_var, 6/*KV_SET*/, is_failure);
+    cheng_assert(isvalid);
+  }
+  return true;
+}
+
+
+// op_num must be the same; otherwise, the CFG is wrong
+Variant HHVM_FUNCTION(oro_apc_fetch_check,
+                      const Variant& key,
+                      const Variant req_no,
+                      const int64_t op_num) {
+  cheng_assert(apc_log_loaded);
+  //cheng_assert(key.m_type != KindOfMulti);
+
+  bool multi = (req_no.m_type == KindOfMulti);
+  bool multi_key = (key.m_type == KindOfMulti);
+
+  if (multi) {
+    TypedValue m_ret = MultiVal::makeMultiVal();
+    bool never_fail = true;
+    int counter = 0;
+    for (auto it : *req_no.m_data.pmulti) {
+      std::string key_str;
+      if (multi_key) {
+        key_str = tvAsVariant(key.m_data.pmulti->getByVal(counter++)).toString().toCppString();
+      } else {
+        key_str = key.toString().toCppString();
+      }
+      std::string result;
+      cheng_assert(it->m_type == KindOfInt64);
+      int64_t rid = it->m_data.num;
+      auto ret = search_tt_apc_log(key_str, rid, op_num, result);
+
+      if (ret) {
+        cheng_assert(never_fail);
+        // FIXME:
+        if (result == "VALNOTSET") {
+          Variant result_str(false);
+          m_ret.m_data.pmulti->addValue(result_str);
+        } else {
+          Variant result_str(result);
+          m_ret.m_data.pmulti->addValue(result_str);
+        }
+      } else {
+        never_fail = false;
+      }
+    }
+    if (never_fail) {
+      return tvAsVariant(&m_ret);
+    } else {
+      return false;
+    }
+  } else {
+    cheng_assert(!multi_key);
+    auto key_str = key.toString().toCppString();
+    int64_t rid = req_no.toInt64Val();
+    std::string result;
+    auto ret = search_tt_apc_log(key_str, rid, op_num, result);
+
+    if (ret) {
+      if (result == "VALNOTSET") {
+        return false;
+      } else {
+        return result; // find the result
+      }
+    } else {
+      return false; // do not find anything
+    }
+  }
+}
+
+Variant HHVM_FUNCTION(oro_apc_delete_check,
+                      const Variant& key,
+                      const Variant req_no,
+                      const int64_t op_num) {
+  cheng_assert(apc_log_loaded);
+  cheng_assert(key.m_type != KindOfMulti);
+
+  auto key_str = key.toString().toCppString();
+  bool multi = (req_no.m_type == KindOfMulti);
+
+  if (multi) {
+    bool first_round = true;
+    bool is_failure = false;
+
+    for (auto it : *req_no.m_data.pmulti) {
+      cheng_assert(it->m_type == KindOfInt64);
+      int64_t rid = it->m_data.num;
+      std::string result;
+      bool cur_is_failure;
+      bool isvalid = match_apc_op(key_str, rid, op_num, "", 7/*KV_DEL*/, cur_is_failure);
+      if (first_round) {
+        first_round = false;
+        is_failure = cur_is_failure;
+      }
+      cheng_assert(isvalid);
+      cheng_assert(is_failure == cur_is_failure);
+    }
+
+    if (is_failure) return false;
+  } else {
+    int64_t rid = req_no.toInt64Val();
+    std::string result;
+    bool is_failure;
+    bool isvalid = match_apc_op(key_str, rid, op_num, "", 7/*KV_DEL*/, is_failure);
+    cheng_assert(isvalid);
+
+    if (is_failure) return false;
+  }
+  return true;
+}
+
+Variant HHVM_FUNCTION(oro_apc_inc_check,
+                      const String& key,
+                      int64_t step,
+                      const Variant req_no,
+                      const int64_t op_num) {
+  // not impl
+  cheng_assert(false);
+  return false;
+}
+
+Variant HHVM_FUNCTION(oro_apc_dec_check,
+                      const String& key,
+                      int64_t step /* = 1 */,
+                      const Variant req_no,
+                      const int64_t op_num) {
+  // not impl
+  cheng_assert(false);
+  return false;
+}
+
+//===========================================
 
 Variant HHVM_FUNCTION(apc_store,
                       const Variant& key_or_array,

@@ -31,6 +31,10 @@
 #include "hphp/runtime/vm/jit/translator-inline.h"
 #include "hphp/util/exception.h"
 
+#include "hphp/runtime/base/array-iterator.h"
+#include "hphp/runtime/base/multi-val.h"
+#include "hphp/runtime/ext/std/ext_std_variable.h"
+
 namespace HPHP {
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -258,6 +262,55 @@ Array hhvm_get_frame_args(const ActRec* ar, int offset) {
   return retInit.toArray();
 }
 
+// cheng-hack: in order to provide multi-array instead of array-with-multivalue
+//Array hhvm_get_frame_args(const ActRec* ar, int offset) {
+static Variant cheng_hhvm_get_frame_args(const ActRec* ar, int offset) {
+  if (ar == nullptr) {
+    return Array();
+  }
+  int numParams = ar->m_func->numNonVariadicParams();
+  int numArgs = ar->numArgs();
+
+  PackedArrayInit retInit(std::max(numArgs - offset, 0));
+  auto local = reinterpret_cast<TypedValue*>(
+    uintptr_t(ar) - sizeof(TypedValue)
+  );
+  local -= offset;
+  for (int i = offset; i < numArgs; ++i) {
+    if (i < numParams) {
+      // This corresponds to one of the function's formal parameters, so it's
+      // on the stack.
+      retInit.append(tvAsCVarRef(local));
+      --local;
+    } else {
+      // This is not a formal parameter, so it's in the ExtraArgs.
+      retInit.append(tvAsCVarRef(ar->getExtraArg(i - numParams)));
+    }
+  }
+
+  // cheng-hack:
+  // create new type of return value
+  Array ret = retInit.toArray();
+  Variant new_ret(ret);
+
+  // check if there is multi-value
+  ArrayIter ait(ret);
+  while(!ait.end()) {
+    auto value = ait.second();
+    if (value.m_type == KindOfMulti) {
+      // need transfer to multi-array
+      TypedValue tv = MultiVal::transferArray(new_ret);
+      always_assert(tv.m_type == KindOfMulti);
+      new_ret = Variant(tv.m_data.pmulti);
+      //HHVM_FN(print_r)(new_ret);
+      break;
+    }
+    ait.next();
+  }
+
+  return new_ret;
+}
+
 #define FUNC_GET_ARGS_IMPL(offset) do {                                        \
   EagerCallerFrame cf;                                                         \
   ActRec* ar = cf.actRecForArgs();                                             \
@@ -267,7 +320,7 @@ Array hhvm_get_frame_args(const ActRec* ar, int offset) {
     );                                                                         \
     return false;                                                              \
   }                                                                            \
-  return hhvm_get_frame_args(ar, offset);                                      \
+  return cheng_hhvm_get_frame_args(ar, offset);                                      \
 } while(0)
 
 Variant HHVM_FUNCTION(func_get_args) {

@@ -554,7 +554,7 @@ class FrameRestore {
       tmp.m_soff = !fp
         ? 0
         : fp->m_func->unit()->offsetOf(pc) - fp->m_func->base();
-      tmp.setThis(nullptr);
+      tmp.setThisSingle(nullptr);
       tmp.m_varEnv = 0;
       tmp.initNumArgs(0);
       vmfp() = &tmp;

@@ -143,6 +143,7 @@ CppCall MCGenerator::getDtorCall(DataType type) {
       return CppCall::method(&RefData::release);
     DT_UNCOUNTED_CASE:
     case KindOfClass:
+    case KindOfMulti:
       break;
   }
   not_reached();
@@ -383,7 +384,7 @@ static void populateLiveContext(RegionContext& ctx) {
       // TODO(#2466980): when it's a Cls, we should pass the Class* in
       // the Type.
       auto const objOrCls =
-        ar->hasThis()  ? Type::Obj.specialize(ar->getThis()->getVMClass()) :
+        ar->hasThis()  ? Type::Obj.specialize(ar->getThisDefault()->getVMClass()) :
         ar->hasClass() ? Type::Cls
                        : Type::Nullptr;
 

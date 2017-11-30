@@ -1420,6 +1420,7 @@ Variant HHVM_FUNCTION(strlen,
     }
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

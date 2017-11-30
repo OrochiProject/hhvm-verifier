@@ -874,8 +874,10 @@ static bool HHVM_FUNCTION(hphp_memory_stop_interval) {
   return MM().stopStatsInterval();
 }
 
+// cheng-hack: for our cli debugging purpose, we fix this to servermode
 String HHVM_FUNCTION(php_sapi_name) {
-  return RuntimeOption::ExecutionMode;
+  return "srv"; 
+  //return RuntimeOption::ExecutionMode;
 }
 
 const StaticString s_s("s");

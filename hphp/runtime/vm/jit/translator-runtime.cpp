@@ -321,6 +321,7 @@ int64_t coerceCellToDblHelper(Cell tv, int64_t argNum, const Func* func) {
       break;
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -360,6 +361,7 @@ int64_t coerceCellToIntHelper(TypedValue tv, int64_t argNum, const Func* func) {
       break;
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -386,6 +388,7 @@ StringData* convCellToStrHelper(TypedValue tv) {
     case KindOfObject:        return convObjToStrHelper(tv.m_data.pobj);
     case KindOfResource:      return convResToStrHelper(tv.m_data.pres);
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:         break;
   }
   not_reached();
@@ -678,6 +681,7 @@ int64_t switchStringHelper(StringData* s, int64_t base, int64_t nTargets) {
       case KindOfObject:
       case KindOfResource:
       case KindOfRef:
+      case KindOfMulti:
       case KindOfClass:
         break;
     }
@@ -759,7 +763,8 @@ void lookupClsMethodHelper(Class* cls,
                            ActRec* fp) {
   try {
     const Func* f;
-    ObjectData* obj = fp->hasThis() ? fp->getThis() : nullptr;
+    // cheng-hack: no idea
+    ObjectData* obj = fp->hasThis() ? fp->getThisSingle() : nullptr;
     Class* ctx = fp->m_func->cls();
     LookupResult res =
       g_context->lookupClsMethod(f, cls, meth, obj, ctx, true);
@@ -771,7 +776,8 @@ void lookupClsMethodHelper(Class* cls,
       assert(res == LookupResult::MethodFoundWithThis ||
              res == LookupResult::MagicCallFound);
       obj->incRefCount();
-      ar->setThis(obj);
+      // cheng-hack: no idea
+      ar->setThisSingle(obj);
     }
     ar->m_func = f;
     if (res == LookupResult::MagicCallFound ||
@@ -902,7 +908,8 @@ void loadFuncContextImpl(FooNR callableNR, ActRec* preLiveAR, ActRec* fp) {
   preLiveAR->m_func = func;
   if (inst) {
     inst->incRefCount();
-    preLiveAR->setThis(inst);
+    // cheng-hack: no idea
+    preLiveAR->setThisSingle(inst);
   } else {
     preLiveAR->setClass(cls);
   }
@@ -972,7 +979,8 @@ void fpushCufHelperArray(ArrayData* arr, ActRec* preLiveAR, ActRec* fp) {
 
     preLiveAR->m_func = func;
     inst->incRefCount();
-    preLiveAR->setThis(inst);
+    // cheng-hack: no idea
+    preLiveAR->setThisSingle(inst);
   } catch (...) {
     *arPreliveOverwriteCells(preLiveAR) = make_tv<KindOfArray>(arr);
     throw;

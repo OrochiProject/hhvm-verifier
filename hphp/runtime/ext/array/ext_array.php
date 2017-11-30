@@ -317,6 +317,11 @@ function array_product(mixed $input): mixed;
  */
 <<__Native>>
 function array_push(mixed &$array, mixed $var, ...$args): mixed;
+// cheng-hack:
+<<__Native>>
+function array_set_multi(mixed &$array, mixed $key, mixed $multi_val): void;
+<<__Native>>
+function array_sys_unset(mixed $array): mixed;
 
 /**
  * Picks one ore more random entries out of an array, and returns the key (or

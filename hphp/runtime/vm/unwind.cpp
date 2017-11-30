@@ -69,7 +69,9 @@ void discardStackTemps(const ActRec* const fp,
       assert(ar == reinterpret_cast<ActRec*>(stack.top()));
       if (ar->isFromFPushCtor()) {
         assert(ar->hasThis());
-        ar->getThis()->setNoDestruct();
+        // cheng-hack: no idea
+        cheng_assert(!ar->isMultiThis());
+        ar->getThisSingle()->setNoDestruct();
       }
       ITRACE(2, "  unwind pop AR : {}\n",
              implicit_cast<void*>(stack.top()));
@@ -170,7 +172,15 @@ UnwindAction tearDownFrame(ActRec*& fp, Stack& stack, PC& pc,
   // already been destructed and/or overwritten due to sharing space with
   // fp->m_r.
   if (fp->isFromFPushCtor() && fp->hasThis() && curOp != OpRetC) {
-    fp->getThis()->setNoDestruct();
+    // cheng-hack:
+    if (fp->isMultiThis()) {
+      auto multi = fp->getThisMulti();
+      for (auto it : *multi) {
+        it->setNoDestruct();
+      }
+    } else {
+      fp->getThisSingle()->setNoDestruct();
+    }
   }
 
   auto const decRefLocals = [&] {

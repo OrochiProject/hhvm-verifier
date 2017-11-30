@@ -172,8 +172,10 @@ namespace {
    *
    * @return bool -
    */
+  // cheng-hack:
+  //function session_decode(string $data): bool;
   <<__Native>>
-  function session_decode(string $data): bool;
+  function session_decode(mixed $data): bool;
 
   /**
    * Destroys all data registered to a session
@@ -190,6 +192,9 @@ namespace {
    */
   <<__Native>>
   function session_encode(): mixed;
+  // cheng-hack:
+  <<__Native>>
+  function multi_session_encode(): mixed;
 
   /**
    * Get the session cookie parameters
@@ -414,6 +419,7 @@ namespace {
    *
    * @return void -
    */
+  // cheng-hack:
   <<__Native>>
   function session_write_close(): void;
 } // Namespace (global)

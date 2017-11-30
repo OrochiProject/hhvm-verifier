@@ -32,10 +32,20 @@
 
 #include "hphp/util/arena.h"
 
+// cheng-hack:
+#include "hphp/runtime/base/multi-val.h"
+
 #include <type_traits>
 
 namespace HPHP {
 struct Resumable;
+
+// cheng-hack:
+extern void cheng_fail(std::string file, int line);
+#define cheng_assert(cond) \
+  if (UNLIKELY(!(cond))) {\
+    cheng_fail(__FILE__, __LINE__);\
+  }
 
 /**
  * These macros allow us to easily change the arguments to iop*() opcode
@@ -76,6 +86,37 @@ void SETOP_BODY(TypedValue* lhs, SetOpOp op, Cell* rhs) {
   SETOP_BODY_CELL(tvToCell(lhs), op, rhs);
 }
 
+//-----------------------------------------------
+// cheng-hack: support multi-this
+
+ALWAYS_INLINE TypedValue
+genMultiVal(sptr< std::vector<ObjectData*> > o) {
+  TypedValue multi = MultiVal::makeMultiVal();
+  for (auto it : *o) {
+    TypedValue tmp{0};
+    tmp.m_type = KindOfObject;
+    tmp.m_data.pobj = it;
+    it->incRefCount();
+    multi.m_data.pmulti->addValue(tmp);
+  }
+  return multi;
+}
+
+ALWAYS_INLINE sptr< std::vector<ObjectData*> >
+genMultiObj(MultiVal* m) {
+  sptr< std::vector<ObjectData*> >  multi_this =
+               std::make_shared< std::vector<ObjectData*> >();
+  for (auto it : *m) {
+    cheng_assert(it->m_type == KindOfObject);
+    ObjectData* tmp = it->m_data.pobj;
+    tmp->incRefCount();
+    multi_this->push_back(tmp);
+  }
+  return multi_this;
+}
+
+
+//-----------------------------------------------
 class Func;
 struct ActRec;
 
@@ -201,6 +242,12 @@ class VarEnv {
  * "pre-live" state is skipped and the ActRec is materialized in the "live"
  * state.
  */
+// cheng-hack:
+// This is a data structure that replace the m_this for single this
+struct MultiThis {
+  sptr< std::vector<ObjectData*> > m_this_array;
+};
+
 struct ActRec {
   union {
     // This pair of uint64_t's must be the first two elements in the structure
@@ -232,6 +279,7 @@ struct ActRec {
                              //   is post-live.
     struct {
       union {
+        MultiThis* m_multi_this; // multi-this
         ObjectData* m_this;    // This.
         Class* m_cls;      // Late bound class.
       };
@@ -263,20 +311,41 @@ struct ActRec {
    * constructors exit via an exception.
    */
 
-  static constexpr int kNumArgsBits = 29;
+  // cheng-hack: add multiThis bit
+  static constexpr int kNumArgsBits = 27/*29*/;
   static constexpr int kNumArgsMask = (1 << kNumArgsBits) - 1;
   static constexpr int kFlagsMask   = ~kNumArgsMask;
 
-  static constexpr int kLocalsDecRefdShift = kNumArgsBits;
-  static constexpr int kResumedShift       = kNumArgsBits + 1;
-  static constexpr int kFPushCtorShift     = kNumArgsBits + 2;
+  static constexpr int kInMultiRoundCall = kNumArgsBits; // used for NativeImpl 
+  static constexpr int kMultiThisShift = kNumArgsBits + 1; // cheng-hack
+  static constexpr int kLocalsDecRefdShift = kNumArgsBits + 2/**/;
+  static constexpr int kResumedShift       = kNumArgsBits + 3/*1*/;
+  static constexpr int kFPushCtorShift     = kNumArgsBits + 4/*2*/;
 
   static_assert(kFPushCtorShift <= 8 * sizeof(int32_t) - 1,
                 "Out of bits in ActRec");
 
+  static constexpr int kMultiThisMask = 1 << kMultiThisShift; // cheng-hack
   static constexpr int kLocalsDecRefdMask = 1 << kLocalsDecRefdShift;
   static constexpr int kResumedMask       = 1 << kResumedShift;
   static constexpr int kFPushCtorMask     = 1 << kFPushCtorShift;
+
+  // cheng-hack:
+  bool isInMultiRound() const {
+    return m_numArgsAndFlags & kInMultiRoundCall;
+  }
+
+  inline void setInMultiRound(bool in) {
+    if (in) {
+      m_numArgsAndFlags |= (1 << kInMultiRoundCall);
+    } else {
+      m_numArgsAndFlags &= ~(1 << kInMultiRoundCall);
+    }
+  }
+
+  bool isMultiThis() const {
+    return m_numArgsAndFlags & kMultiThisMask;
+  }
 
   int32_t numArgs() const {
     return m_numArgsAndFlags & kNumArgsMask;
@@ -300,29 +369,36 @@ struct ActRec {
 
   static inline uint32_t
   encodeNumArgs(uint32_t numArgs, bool localsDecRefd, bool resumed,
-                bool isFPushCtor) {
+                bool isFPushCtor, bool isMultiThis) {
     assert((numArgs & kFlagsMask) == 0);
+    // cheng-hack:
     return numArgs |
       (localsDecRefd << kLocalsDecRefdShift) |
       (resumed       << kResumedShift) |
+      (isMultiThis   << kMultiThisShift) |
       (isFPushCtor   << kFPushCtorShift);
   }
 
   void initNumArgs(uint32_t numArgs) {
-    m_numArgsAndFlags = encodeNumArgs(numArgs, false, false, false);
+    m_numArgsAndFlags = encodeNumArgs(numArgs, false, false, false, false);
+  }
+
+  // cheng-hack:
+  void initNumArgsFromMultiThis(uint32_t numArgs) {
+    m_numArgsAndFlags = encodeNumArgs(numArgs, false, false, false, true);
   }
 
   void initNumArgsFromResumable(uint32_t numArgs) {
-    m_numArgsAndFlags = encodeNumArgs(numArgs, false, true, false);
+    m_numArgsAndFlags = encodeNumArgs(numArgs, false, true, false, false);
   }
 
   void initNumArgsFromFPushCtor(uint32_t numArgs) {
-    m_numArgsAndFlags = encodeNumArgs(numArgs, false, false, true);
+    m_numArgsAndFlags = encodeNumArgs(numArgs, false, false, true, false);
   }
 
   void setNumArgs(uint32_t numArgs) {
     m_numArgsAndFlags = encodeNumArgs(numArgs, localsDecRefd(), resumed(),
-                                      isFromFPushCtor());
+                                      isFromFPushCtor(), isMultiThis());
   }
 
   void setLocalsDecRefd() {
@@ -355,7 +431,12 @@ struct ActRec {
     m_this = (ObjectData*)objOrCls;
   }
 
+  // cheng-hack:
   void* getThisOrClass() const {
+    if (hasThis()) {
+      return getThisSingle();
+    }
+    // original case, since class and this are overlapped
     return m_this;
   }
 
@@ -385,9 +466,51 @@ struct ActRec {
   static constexpr int8_t kHasClassBit = 0x1;
   static constexpr int8_t kClassMask   = ~kHasClassBit;
 
+  // cheng-hack
+  inline bool hasThis() const {
+    return (m_this && !(reinterpret_cast<intptr_t>(m_this) & kHasClassBit))
+      || isMultiThis();
+  }
+
+  /* Original impl
   inline bool hasThis() const {
     return m_this && !(reinterpret_cast<intptr_t>(m_this) & kHasClassBit);
   }
+  */
+  // cheng-hack
+  inline ObjectData* getThisSingle() const {
+    cheng_assert(!isMultiThis());
+    return m_this;
+  }
+  // cheng-hack
+  inline sptr< std::vector<ObjectData*> >  getThisMulti() const {
+    cheng_assert(isMultiThis());
+    return m_multi_this->m_this_array;
+  }
+  // cheng-hack:
+  inline ObjectData* getThisDefault() const {
+    if (isMultiThis()) {
+      return (*m_multi_this->m_this_array)[0];
+    } else {
+      return m_this;
+    }
+  }
+
+  // cheng-hack
+  inline void setThisSingle(ObjectData* val) {
+    m_numArgsAndFlags &= ~(1 << kMultiThisShift);
+    m_this = val;
+  }
+
+  // cheng-hack
+  inline void setThisMulti(sptr< std::vector<ObjectData*> > val) {
+    m_numArgsAndFlags |= (1 << kMultiThisShift);
+    // FIXME: is it ok to just reuse this slot?
+    m_multi_this = new MultiThis(); 
+    m_multi_this->m_this_array = val;
+  }
+
+  /*  Original implementation
   inline ObjectData* getThis() const {
     assert(hasThis());
     return m_this;
@@ -395,6 +518,7 @@ struct ActRec {
   inline void setThis(ObjectData* val) {
     m_this = val;
   }
+  */
   inline bool hasClass() const {
     return reinterpret_cast<intptr_t>(m_cls) & kHasClassBit;
   }
@@ -642,7 +766,17 @@ public:
   void popV() {
     assert(m_top != m_base);
     assert(refIsPlausible(*m_top));
-    tvDecRefRef(m_top);
+    // cheng-hack: used to be a bug, this will crash
+    // the multiVal data structure because of treating it as Ref
+    if (LIKELY(m_top->m_type == KindOfRef)) {
+      tvDecRefRef(m_top);
+    } else if (UNLIKELY(m_top->m_type == KindOfMulti &&
+                m_top->m_data.pmulti->getType() == KindOfRef)) {
+      int size = m_top->m_data.pmulti->valSize();
+      for (int i=0; i<size; i++) {
+        tvDecRefRef(m_top->m_data.pmulti->getByVal(i));
+      }
+    }
     tvDebugTrash(m_top);
     m_top++;
   }
@@ -663,7 +797,16 @@ public:
   void popAR() {
     assert(m_top != m_base);
     ActRec* ar = (ActRec*)m_top;
-    if (ar->hasThis()) decRefObj(ar->getThis());
+    if (ar->hasThis()) {
+      // cheng-hack:
+      if (ar->isMultiThis()) {
+        for (auto it : *ar->getThisMulti()) {decRefObj(it);}
+        // delete the m_multi_this structure
+        delete ar->m_multi_this;
+      } else {
+        decRefObj(ar->getThisSingle());
+      }
+    }
     if (ar->hasInvName()) decRefStr(ar->getInvName());
 
     // This should only be used on a pre-live ActRec.
@@ -730,12 +873,14 @@ public:
   void box() {
     assert(m_top != m_base);
     assert(m_top->m_type != KindOfRef);
+    assert(m_top->m_type != KindOfMulti);
     tvBox(m_top);
   }
 
   ALWAYS_INLINE
   void unbox() {
     assert(m_top != m_base);
+    assert(m_top->m_type != KindOfMulti);
     tvUnbox(m_top);
   }
 
@@ -840,6 +985,14 @@ public:
     o->incRefCount();
   }
 
+  // cheng-hack:
+  ALWAYS_INLINE
+  void pushMultiObject(TypedValue& o) {
+    assert(m_top != m_elms);
+    m_top--;
+    tvCopy(o, *m_top);
+  }
+
   ALWAYS_INLINE
   void nalloc(size_t n) {
     assert((uintptr_t)&m_top[-n] <= (uintptr_t)m_base);
@@ -941,7 +1094,8 @@ public:
   ALWAYS_INLINE
   Ref* topV() {
     assert(m_top != m_base);
-    assert(m_top->m_type == KindOfRef);
+    assert(m_top->m_type == KindOfRef ||
+           (m_top->m_type == KindOfMulti && m_top->m_data.pmulti->getType() == KindOfRef) );
     return (Ref*)m_top;
   }
 

@@ -449,6 +449,7 @@ void APCDetailedStats::addType(APCHandle* handle) {
 
     case KindOfResource:
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -495,6 +496,7 @@ void APCDetailedStats::removeType(APCHandle* handle) {
 
     case KindOfResource:
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

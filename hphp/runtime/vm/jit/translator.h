@@ -504,6 +504,7 @@ enum OutTypeConstraints {
   OutSetOp,             // For SetOpL
   OutIncDec,            // For IncDecL
   OutStrlen,            // OpStrLen
+  OutAddMulti,          // OpAddMulti, cheng-hack
   OutClassRef,          // KindOfClass
   OutFPushCufSafe,      // FPushCufSafe pushes two values of different
                         // types and an ActRec

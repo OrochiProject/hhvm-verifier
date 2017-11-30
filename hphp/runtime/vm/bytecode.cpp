@@ -107,6 +107,14 @@
 
 #include "hphp/runtime/vm/globals-array.h"
 
+// cheng-hack:
+#include "hphp/runtime/base/multi-val.h"
+#include "functional"
+#include "mutex"
+#include "hphp/runtime/vm/yastopwatch.h"
+#include <thread>
+#include <time.h>
+
 namespace HPHP {
 
 // TODO: #1746957, #1756122
@@ -129,6 +137,1470 @@ using jit::mcg;
 #define OPTBLD_INLINE ALWAYS_INLINE
 #endif
 TRACE_SET_MOD(bcinterp);
+
+//===========================================
+//===========================================
+// cheng-hack:
+
+// verification related
+bool cheng_verification = false;
+thread_local std::stringstream veri_buf;
+thread_local bool is_resource_req = false;
+
+//#define CHENG_INS_DEBUG
+//#define CHENG_INS_ONLY_DEBUG
+//#define CHENG_TIME_EVAL
+//#define CHENG_COUNT_INS // will overwrite the CHENG_TIME_EVAL's multi_time
+//#define CHENG_CYCLE_WAR_TUNING
+//#define CHENG_DEBUG_STACK
+//#define CHENG_PRINT_N 0
+//#define CHENG_CLASSIFY_INS_PROF
+//#define CHENG_PRINT_CF // conflict with CHENG_CLASSIFY_INS_PROF, shut down print_ins
+
+#define CHENG_USE_CLOCK_CPU_TIME
+
+//#define CHENG_CHECK
+
+//#define CHENG_OPT_1
+#define CHENG_OPT_DB_UPDATE
+
+//#undef CHENG_CHECK
+
+// for profiling the steps in verification not in normal exec
+DEF_SW(db_trans_time);
+DEF_SW(db_dedup_time);
+DEF_SW(apc_time);
+DEF_SW(opmap_time);
+
+// program state variables
+std::string site_root;
+thread_local int batch_size = 1;
+thread_local bool php_code_running = false;
+
+// POINT1: loop capture mode
+thread_local bool loop_capture_mode = false;
+thread_local std::vector<TypedValue> finish_loop_var;
+thread_local std::vector<TypedValue> finish_capture_var;
+thread_local std::vector<int> loop_alive;
+thread_local TypedValue origin_loop_var_ref;
+thread_local TypedValue origin_capture_var_ref;
+
+// POINT2: mode on builtin/constructor/magic methods
+thread_local bool single_mode_on = false;
+thread_local int  single_mode_cur_iter = -1;
+thread_local int  single_mode_size = -1;
+
+thread_local int zone_level = 0;
+thread_local int zone_index = -1;
+
+// POINT3: for builtin class __construct
+thread_local bool builtin_class_new = false;
+
+std::string builtin_class[] = {
+  "DateTime"
+};
+
+ALWAYS_INLINE static bool
+isBuiltinClass(std::string cname) {
+  for (auto str_it : builtin_class) {
+    if (str_it == cname) return true;
+  }
+  return false;
+}
+
+bool without_crash = false; 
+bool should_count = true;
+thread_local int nested_ins_level = 0;
+thread_local int64_t ins_counter = 0;
+thread_local int64_t multi_ins_counter = 0;
+
+//======== break-even batch size ==========
+int64_t batch_upperbound = LONG_MAX;
+
+int64_t
+get_batch_upperbound() {
+  return batch_upperbound;
+}
+
+void
+set_batch_upperbound(int64_t bound) {
+  cheng_assert(bound > 1);
+  batch_upperbound = bound;
+}
+
+//======== clock to get cpu time ==========
+
+inline void
+flush_clock_cpu_time() {
+#ifdef CHENG_USE_CLOCK_CPU_TIME
+  // measure the cpu time using clock()
+  double time_elapsed = (double)clock() / CLOCKS_PER_SEC * 1000;
+  std::ofstream otf6("/tmp/hhvmm_cpu_time.log", std::ofstream::app);
+  otf6 << time_elapsed << "\n";
+  otf6.close();
+#endif
+}
+
+//======== alpha related functions =========
+#ifdef CHENG_COUNT_INS 
+
+inline void
+nested_ins_level_inc() {
+  cheng_assert(nested_ins_level>=0);
+  nested_ins_level++;
+}
+
+inline void
+nested_ins_level_dec() {
+  cheng_assert(nested_ins_level>0);
+  nested_ins_level--;
+}
+
+inline void
+ins_counter_inc() {
+  if (LIKELY(nested_ins_level == 0)) ins_counter++;
+  //ins_counter++;
+}
+
+#else 
+
+inline void nested_ins_level_inc() { ((void)0); }
+inline void nested_ins_level_dec() { ((void)0); }
+inline void ins_counter_inc() { ((void)0); }
+
+#endif
+
+//======= scientific functions ========
+thread_local int oparr_ins_counter = 0;
+thread_local int oparith_ins_counter = 0;
+thread_local int opcf_ins_counter = 0;
+thread_local int opget_ins_counter = 0;
+thread_local int opset_ins_counter = 0;
+thread_local int opisset_ins_counter = 0;
+thread_local int opcall_ins_counter = 0;
+thread_local int opmember_ins_counter = 0;
+thread_local int opiter_ins_counter = 0;
+thread_local int opmisc_ins_counter = 0;
+
+thread_local int oparr_mins_counter = 0;
+thread_local int oparith_mins_counter = 0;
+thread_local int opcf_mins_counter = 0;
+thread_local int opget_mins_counter = 0;
+thread_local int opset_mins_counter = 0;
+thread_local int opisset_mins_counter = 0;
+thread_local int opcall_mins_counter = 0;
+thread_local int opmember_mins_counter = 0;
+thread_local int opiter_mins_counter = 0;
+thread_local int opmisc_mins_counter = 0;
+
+#ifdef CHENG_CLASSIFY_INS_PROF
+
+inline void clear_classify_ins_counter() {
+  oparr_ins_counter = 0;
+  oparith_ins_counter = 0;
+  opcf_ins_counter = 0;
+  opget_ins_counter = 0;
+  opset_ins_counter = 0;
+  opisset_ins_counter = 0;
+  opcall_ins_counter = 0;
+  opmember_ins_counter = 0;
+  opiter_ins_counter = 0;
+  opmisc_ins_counter = 0;
+
+  oparr_mins_counter = 0;
+  oparith_mins_counter = 0;
+  opcf_mins_counter = 0;
+  opget_mins_counter = 0;
+  opset_mins_counter = 0;
+  opisset_mins_counter = 0;
+  opcall_mins_counter = 0;
+  opmember_mins_counter = 0;
+  opiter_mins_counter = 0;
+  opmisc_mins_counter = 0;
+}
+
+inline void as_arr() {
+  if (LIKELY(nested_ins_level == 0)) oparr_ins_counter++;
+}
+
+inline void as_arith() {
+  if (LIKELY(nested_ins_level == 0)) oparith_ins_counter++;
+}
+
+inline void as_cf() {
+  if (LIKELY(nested_ins_level == 0)) opcf_ins_counter++;
+}
+
+inline void as_get() {
+  if (LIKELY(nested_ins_level == 0)) opget_ins_counter++;
+}
+
+inline void as_set() {
+  if (LIKELY(nested_ins_level == 0)) opset_ins_counter++;
+}
+
+inline void as_isset() {
+  if (LIKELY(nested_ins_level == 0)) opisset_ins_counter++;
+}
+
+inline void as_call() {
+  if (LIKELY(nested_ins_level == 0)) opcall_ins_counter++;
+}
+
+inline void as_member() {
+  if (LIKELY(nested_ins_level == 0)) opmember_ins_counter++;
+}
+
+inline void as_iter() {
+  if (LIKELY(nested_ins_level == 0)) opiter_ins_counter++;
+}
+
+inline void as_misc() {
+  if (LIKELY(nested_ins_level == 0)) opmisc_ins_counter++;
+}
+
+
+inline void as_marr() {
+  if (LIKELY(nested_ins_level == 0)) {
+    oparr_ins_counter--;
+    oparr_mins_counter++;
+  }
+}
+
+inline void as_marith() {
+  if (LIKELY(nested_ins_level == 0)) {
+    oparith_ins_counter--;
+    oparith_mins_counter++;
+  }
+}
+
+inline void as_mcf() {
+  if (LIKELY(nested_ins_level == 0)) {
+    opcf_ins_counter--;
+    opcf_mins_counter++;
+  }
+}
+
+inline void as_mget() {
+  if (LIKELY(nested_ins_level == 0)) {
+    opget_ins_counter--;
+    opget_mins_counter++;
+  }
+}
+
+inline void as_mset() {
+  if (LIKELY(nested_ins_level == 0)) {
+    opset_ins_counter--;
+    opset_mins_counter++;
+  }
+}
+
+inline void as_misset() {
+  if (LIKELY(nested_ins_level == 0)) {
+    opisset_ins_counter--;
+    opisset_mins_counter++;
+  }
+}
+
+inline void as_mcall() {
+  if (LIKELY(nested_ins_level == 0)) {
+    opcall_ins_counter--;
+    opcall_mins_counter++;
+  }
+}
+
+inline void as_mmember() {
+  if (LIKELY(nested_ins_level == 0)) {
+    opmember_ins_counter--;
+    opmember_mins_counter++;
+  }
+}
+
+inline void as_miter() {
+  if (LIKELY(nested_ins_level == 0)) {
+    opiter_ins_counter--;
+    opiter_mins_counter++;
+  }
+}
+
+inline void as_mmisc() {
+  if (LIKELY(nested_ins_level == 0)) {
+    opmisc_ins_counter--;
+    opmisc_mins_counter++;
+  }
+}
+
+#define CLEAR_CLASSIFY_INS_COUNTER clear_classify_ins_counter()
+#define AS_ARR    as_arr() 
+#define AS_ARITH  as_arith() 
+#define AS_CF     as_cf() 
+#define AS_GET    as_get() 
+#define AS_SET    as_set() 
+#define AS_ISSET  as_isset() 
+#define AS_CALL   as_call()
+#define AS_MEMBER as_member() 
+#define AS_ITER   as_iter() 
+#define AS_MISC   as_misc() 
+
+#define AS_MARR    as_marr() 
+#define AS_MARITH  as_marith() 
+#define AS_MCF     as_mcf() 
+#define AS_MGET    as_mget() 
+#define AS_MSET    as_mset() 
+#define AS_MISSET  as_misset() 
+#define AS_MCALL   as_mcall()
+#define AS_MMEMBER as_mmember() 
+#define AS_MITER   as_miter() 
+#define AS_MMISC   as_mmisc() 
+
+#else 
+
+#define CLEAR_CLASSIFY_INS_COUNTER ((void)0) 
+#define AS_ARR    ((void)0)
+#define AS_ARITH  ((void)0)
+#define AS_CF     ((void)0)
+#define AS_GET    ((void)0)
+#define AS_SET    ((void)0)
+#define AS_ISSET  ((void)0)
+#define AS_CALL   ((void)0)
+#define AS_MEMBER ((void)0)
+#define AS_ITER   ((void)0)
+#define AS_MISC   ((void)0)
+
+#define AS_MARR    ((void)0)
+#define AS_MARITH  ((void)0)
+#define AS_MCF     ((void)0)
+#define AS_MGET    ((void)0)
+#define AS_MSET    ((void)0)
+#define AS_MISSET  ((void)0)
+#define AS_MCALL   ((void)0)
+#define AS_MMEMBER ((void)0)
+#define AS_MITER   ((void)0)
+#define AS_MMISC   ((void)0)
+#endif
+
+
+//======== helper functions =========
+static std::vector<string> str_explode(std::string str, std::string delimiter){
+  std::vector<string> ret;
+  size_t start = 0, end = str.find(delimiter); 
+
+  while (end != std::string::npos) {
+    ret.push_back(str.substr(start, end-start));
+    start = end + delimiter.length();
+    end = str.find(delimiter, start);
+  }
+
+  // the last one
+  auto end_piece = str.substr(start);
+  if (end_piece != "") {
+    ret.push_back(str.substr(start));
+  }
+
+  return ret;
+}
+
+static inline std::string trim(std::string &s) {
+  s.erase(s.begin(), std::find_if(s.begin(), s.end(),
+          std::not1(std::ptr_fun<int, int>(std::isspace))));
+
+  s.erase(std::find_if(s.rbegin(), s.rend(),
+          std::not1(std::ptr_fun<int, int>(std::isspace))).base(), s.end());
+  return s;
+}
+
+//======== OpMap ===============
+bool opmap_loaded = false;
+std::map<std::string, std::pair<int, int> > opmap;
+
+// should be synced with hintprocess
+#define HINTPROCESS_MAX_OP_NUM 999998
+const static int encode_op_length = (HINTPROCESS_MAX_OP_NUM + 2);
+
+void
+load_opmap(std::string fpath) {
+  std::ifstream inf(fpath);
+  if (!inf.good()) {
+    std::cout << "Cannot find " << fpath << "\n"; 
+    cheng_assert(false);
+  }
+
+  std::stringstream ss;
+  ss << inf.rdbuf();
+  auto contents = ss.str();
+
+  // format: 
+  // reqno*encode_op_length+opnum:type,seq_num;...
+  std::vector<std::string> entries = str_explode(contents, ";");
+
+  for (auto entry : entries) {
+    if (trim(entry) == "") continue;
+    auto kv = str_explode(entry, ":");
+    cheng_assert(kv.size() == 2);
+    // req-opnum
+    // opid is in the form of rid-opnum
+
+    int64_t rid_opnum = stoll(kv[0]);
+    int64_t rid = rid_opnum / encode_op_length;
+    int op_num = rid_opnum % encode_op_length;
+    std::string opid = std::to_string(rid) + "-" + std::to_string(op_num);
+
+    // type and seqnum
+    auto info = str_explode(kv[1], ",");
+    int type = stoi(info[0]);
+    int seqnum = stoi(info[1]);
+
+    opmap[opid] = std::make_pair(type, seqnum);
+  }
+
+  inf.close();
+  opmap_loaded = true;
+}
+
+int
+search_opmap(int rid, int opnum, int type) {
+  START_SW(opmap_time);
+  auto opid = std::to_string(rid) + "-" + std::to_string(opnum);
+  // assert this rid-opnum exists
+  //cheng_assert(opmap.find(opid) != opmap.end());
+  if(opmap.find(opid) == opmap.end()) {
+    std::cout << "Cannot find such operation in opmap: rid-opnum=" << opid << " type=" << type << "\n";
+    cheng_assert(false);
+  }
+  auto pair = opmap[opid];
+  // assert the type is the same
+  if (!(type == TYPE_NONE || pair.first == type ||
+    (pair.first == SQL_TXN && (type == SQL_READ|| type == SQL_WRITE)) ) ) {
+    std::cout << "opid: " << opid << " is type " << type << 
+     " , but should be " << pair.first << ", seqnum " << pair.second << "\n";
+    cheng_assert(false);
+  }
+  // return the seqnum
+  STOP_SW(opmap_time);
+  return pair.second;
+}
+
+//=========MaxOp==============
+bool maxop_loaded = false;
+std::map<int,int> maxop_map;
+
+void
+load_maxop(std::string fpath) {
+  std::ifstream inf(fpath);
+  if (!inf.good()) {
+    std::cout << "Cannot find " << fpath << "\n"; 
+    cheng_assert(false);
+  }
+
+  std::stringstream ss;
+  ss << inf.rdbuf();
+  auto contents = ss.str();
+  inf.close();
+
+  // format: 
+  // reqno-opnum:type,seq_num;...
+  std::vector<std::string> entries = str_explode(contents, ",");
+
+  for (auto entry : entries) {
+    if (trim(entry) == "") continue;
+    auto kv = str_explode(entry, ":");
+    if (kv.size() != 2) {
+      std::cout << "ill-format maxop entry: [" << entry << "]\n";
+      cheng_assert(false);
+    }
+    // req-opnum
+    int rid = stoi(kv[0]);
+    int opnum = stoi(kv[1]);
+    // should be no duplicated rid
+    cheng_assert(maxop_map.find(rid) == maxop_map.end());
+    maxop_map[rid] = opnum;
+  }
+
+  maxop_loaded = true;
+}
+
+bool
+check_maxop(int rid,  int last_op_num) {
+  cheng_assert(maxop_loaded);
+  cheng_assert(maxop_map.find(rid) != maxop_map.end());
+  if (maxop_map[rid] != last_op_num) {
+    std::cout << "check_maxop, re-exec want to stop at opnum[" << last_op_num 
+      << "],  however original maxop is [" << maxop_map[rid] << "]\n";
+    cheng_assert(false);
+  }
+  return true;
+}
+
+//======== TTdb ===============
+uint64_t max_int = LLONG_MAX; 
+bool table_update_log_loaded = false;
+std::map<std::string, std::vector<uint64_t> > table_update_log;
+
+#ifdef CHENG_OPT_DB_UPDATE
+
+static std::vector<string> str_split(std::string str, char delimiter){
+  std::vector<string> ret;
+  size_t start = 0, end = str.find(delimiter); 
+
+  while (end != std::string::npos) {
+    ret.push_back(str.substr(start, end-start));
+    start = end + 1; 
+    end = str.find(delimiter, start);
+  }
+
+  // the last one
+  ret.push_back(str.substr(start));
+
+  return ret;
+}
+
+void dump_table_update_log() {
+  std::cout << "=============\n";
+  for (auto it = table_update_log.begin(); it != table_update_log.end(); it++) {
+    std::cout << it->first << ":\n    ";
+    for (auto nit : it->second) {
+      std::cout << nit << ", ";
+    }
+    std::cout << "\n";
+  }
+  std::cout << "=============\n";
+}
+#endif
+
+// this will return the last update timestamp of such table
+uint64_t
+search_table_update_log (std::string tname, uint64_t cur_ts) {
+#ifdef CHENG_OPT_DB_UPDATE
+  tname = (tname[0]=='`' ? tname.substr(1,tname.length()-2) : tname);
+  auto ts_arr = table_update_log[tname];
+  if (ts_arr.size() == 0) {
+    std::cout << "The table [" << tname << "] upadte log is empty\n";
+    cheng_assert(false);
+  }
+
+  int size = ts_arr.size();
+  for (int i=size-1; i>=0; i--) {
+    if (cur_ts > ts_arr[i]) {
+      return ts_arr[i];
+    }
+  }
+  cheng_assert(false);
+#endif
+  return -1;
+}
+
+void
+load_table_update_log(std::string fpath) {
+#ifdef CHENG_OPT_DB_UPDATE
+  std::ifstream inf(fpath);
+  std::stringstream ss;
+  ss << inf.rdbuf();
+  auto contents = ss.str();
+
+  auto table_arr = str_split(contents, '|');
+  for (auto str_table : table_arr) {
+    if (str_table == "") continue;
+
+    auto name_times = str_split(str_table, ':');
+    auto name = name_times[0];
+    auto str_times = name_times[1];
+
+    auto time_arr = str_split(str_times, ',');
+    std::vector<uint64_t> ts_arr;
+    ts_arr.push_back(0);
+    for (int i = 0; i < time_arr.size(); i++) {
+      if (time_arr[i]== "") continue;
+      uint64_t ts = stoll(time_arr[i]);
+      if (ts!=0) {
+        ts_arr.push_back(ts);
+      }
+    }
+    ts_arr.push_back(max_int);
+    table_update_log[name] = ts_arr;
+  }
+
+  table_update_log_loaded = true;
+#endif
+}
+
+//==========session=============
+bool sess_log_loaded = false;
+// {sess_id => vector of ("rid-opnum",  "write"|"read"), ...}
+std::map<std::string, std::vector<std::pair<std::string, std::string> > >  sess_history;
+// lookup table: rid-opnum => sess_id 
+std::map<std::string, std::string> sess_id_map;
+
+void
+load_sess_log(std::string fpath) {
+  std::ifstream inf(fpath);
+  if (!inf.good()) {
+    std::cout << "Cannot find " << fpath << "\n";
+    cheng_assert(false);
+  }
+
+  std::stringstream ss;
+  ss << inf.rdbuf();
+  auto contents = ss.str();
+
+  // format: 
+  // rid #&# opnum #&# [write|read] #&# key |]|
+  std::vector<std::string> entries = str_explode(contents, "|]|");
+
+  for (auto entry : entries) {
+    if (trim(entry) == "") continue;
+    auto info = str_explode(entry, "#&#");
+    //if (info.size() != 4) {
+    //  std::cout << "[" << entry << "]\n";
+    //}
+    cheng_assert(info.size() == 4);
+    auto rid = info[0];
+    auto opnum = info[1];
+    auto type = info[2];
+    auto sid = info[3];
+    auto opid = rid + "-" + opnum;
+
+    if (sess_history.find(sid) == sess_history.end()) {
+      std::vector<std::pair<std::string, std::string> > vec;
+      sess_history[sid] = vec; 
+    }
+    sess_history[sid].push_back(std::make_pair(opid, type));
+    cheng_assert(sess_id_map.find(opid) == sess_id_map.end());
+    sess_id_map[opid] = sid;
+  }
+
+  sess_log_loaded = true;
+  inf.close();
+}
+
+
+// NOTE: only called during PHP: session_start()
+std::string
+_sess_get_last_write(int64_t rid, int64_t opnum, std::string sess_id) {
+  // check the type
+  search_opmap(rid, opnum, REGISTER_READ);
+  cheng_assert(sess_history.find(sess_id) != sess_history.end());
+
+  std::pair<std::string, std::string> prev_w = std::make_pair("NULL","NULL");
+  std::string cur_op_id = std::to_string(rid) + "-" + std::to_string(opnum);
+
+  for (auto it : sess_history[sess_id]) {
+    std::string op_id = it.first;
+    std::string op_type = it.second;
+
+    // find cur_op
+    if (op_id == cur_op_id)
+    {
+      cheng_assert(op_type == "read");
+      break;
+    }
+
+    // keep track previous write
+    if (op_type == "write") {
+      prev_w = it;
+    }
+  }
+
+  // return name: S_key_rid_opnum
+  std::string op_id = prev_w.first;
+  std::string op_type = prev_w.second;
+  if (op_id == "NULL") {
+    // find nothing
+    return "NULL";
+  } else {
+    cheng_assert(op_type == "write");
+    auto info = str_explode(op_id, "-");
+    return "S_" + sess_id + "_" + info[0] + "_" + info[1];
+  }
+} 
+
+std::string
+_sess_get_id(int64_t rid, int64_t opnum, bool check) {
+  if (check) {
+    // check the type
+    search_opmap(rid, opnum, REGISTER_WRITE);
+  }
+
+  auto cur_op_id = std::to_string(rid) + "-" + std::to_string(opnum);
+  if (sess_id_map.find(cur_op_id) == sess_id_map.end()) {
+    return "NULL";
+  } else {
+    return sess_id_map[cur_op_id];
+  }
+}
+
+
+//==========tt apc=============
+bool apc_log_loaded = false;
+// Note: for one key, the elements in apc_tt_vals[key] and apc_tt_seq[key]
+// has one-to-one mapping. 
+// key => [val1, val2, val3 ...]
+std::map<std::string, std::vector<std::string> > apc_tt_vals;
+// key => [seq1, seq2, seq3 ...]
+std::map<std::string, std::vector<int> > apc_tt_seq;
+// a set keeps all the failed ops
+std::set<std::string> apc_fail_op_list;
+
+
+void
+load_apc_log(std::string fpath) {
+  std::ifstream inf(fpath);
+  if (!inf.good()) {
+    std::cout << "Cannot find " << fpath << "\n";
+    cheng_assert(false);
+  }
+
+  std::stringstream ss;
+  ss << inf.rdbuf();
+  auto contents = ss.str();
+  inf.close();
+
+  // format: 
+  // store: 7, fetch 4, delete 5 
+  // rid,opnum,{store|fetch|delete},key,[val|NULL|ret],[ttl|NULL|NULL],[ret|NULL|NULL]
+  std::vector<std::string> key_entries = str_explode(contents, "]&#]");
+
+  int seq_num = 0; // NOTE: matching number in OpMap
+  for (auto key_values : key_entries) {
+    auto kv = str_explode(key_values, "#&#");
+    cheng_assert(kv.size() >= 4);
+    auto optype = kv[2];
+    std::string key = kv[3];
+
+    if (optype == "store" || optype == "delete") {
+      bool is_store = (optype == "store");
+      cheng_assert(key != "");
+      std::string val = "";
+      if (is_store) {
+        cheng_assert(kv.size() == 7);
+        cheng_assert(kv[6] == "1"); // suppose always success
+        val = kv[4];  
+      } else {
+        cheng_assert(kv.size() == 5);
+        if (kv[4] == "0") {
+          // if delete fails, add it to failed list
+          auto op_id = kv[0] + "-" + kv[1];
+          cheng_assert(apc_fail_op_list.find(op_id) == apc_fail_op_list.end());
+          apc_fail_op_list.insert(op_id);
+        }
+      }
+      // if first meet this key
+      if (apc_tt_vals.find(key) == apc_tt_vals.end()) {
+        cheng_assert(apc_tt_seq.find(key) == apc_tt_seq.end());
+        vector<std::string> empty_str;
+        apc_tt_vals[key] = empty_str; 
+        vector<int> empty_int;
+        apc_tt_seq[key] = empty_int;
+      }
+      apc_tt_vals[key].push_back(val);
+      apc_tt_seq[key].push_back(seq_num);
+    } else if (optype == "fetch") {
+      // do nothing
+    } else {
+      std::cout << "ERROR: unimplement apc type: " << optype << "\n";
+      cheng_assert(false);
+    }
+    seq_num++;
+  }
+
+  // validation
+  cheng_assert(apc_tt_vals.size() == apc_tt_seq.size());
+  for (auto it = apc_tt_vals.begin(); it != apc_tt_vals.end(); it++) {
+    auto key = it->first;
+    cheng_assert(apc_tt_seq.find(key) != apc_tt_seq.end());
+    auto val_vec = it->second;
+    cheng_assert(val_vec.size() == apc_tt_seq[key].size());
+    // the apc_tt_seq should be sorted
+    int prev = -1;
+    for (auto seq : apc_tt_seq[key]) {
+      cheng_assert(seq > prev);
+      prev = seq;
+    }
+  }
+
+  apc_log_loaded = true; 
+}
+
+
+inline uint64_t
+get_last_smaller(const std::vector<uint64_t>& v, uint64_t x) {
+  int first = 0, last = int(v.size()) - 1;
+  while (first <= last)
+  {
+    int mid = (first + last) / 2;
+    if (v[mid] >= x)
+      last = mid - 1;
+    else
+      first = mid + 1;
+  }
+  return first - 1 < 0 ? -1 : v[first - 1];
+}
+
+inline int 
+get_indx_last_smaller_or_equal(const std::vector<int>& v, int x) {
+  int first = 0, last = int(v.size()) - 1;
+  if (last < 0) {
+    return -1;
+  }
+
+  // if first and last is within 1, we are good 
+  while(first+1 < last) {
+    int mid = (first + last) / 2;
+    if (v[mid] > x) {
+      last = mid;
+    } else if (v[mid] < x) {
+      first = mid;
+    } else {
+      first = last = mid;
+      break;
+    }
+  }
+
+  if (v[last] <= x) {
+    return last;
+  } else if (v[first] <= x) {
+    return first;
+  } else {
+    return -1;
+  }
+}
+
+// optimization: binary search
+bool
+search_tt_apc_log(std::string key, int64_t rid, int64_t opnum, std::string &result) {
+  START_SW(apc_time);
+  int seq_num = search_opmap(rid, opnum, KV_GET);
+  // no such key, return ""
+  if (apc_tt_seq.find(key) == apc_tt_seq.end()) {
+    result = "VALNOTSET"; // FIXME
+    STOP_SW(apc_time);
+    return true;
+  }
+
+  int val_indx = get_indx_last_smaller_or_equal(apc_tt_seq[key], seq_num);
+  if (val_indx == -1) {
+    result = "VALNOTSET"; // FIXME
+    STOP_SW(apc_time);
+    return true;
+  }
+
+  result = apc_tt_vals[key][val_indx];
+  STOP_SW(apc_time);
+  return true;
+}
+
+void
+debug_apc(std::string key, int64_t rid, int64_t opnum, std::string value, std::string reason) {
+  std::cout << "key:" << key << " in " << rid << "-" << opnum << " with value:[" << value << "]\n"; 
+  std::cout << "   reason: " << reason << "\n";
+}
+
+// for store/delete to check if at that point (rid,opnum), there is such an update
+bool
+match_apc_op(std::string key, int64_t rid, int64_t opnum, std::string value, int type, bool& is_failure) {
+  START_SW(apc_time);
+  int seq_num = search_opmap(rid, opnum, type);
+  // cannot find the key
+  if (apc_tt_seq.find(key) == apc_tt_seq.end()) {
+    debug_apc(key,rid,opnum,value,"cannot find key");
+    STOP_SW(apc_time);
+    return false;
+  }
+
+  int val_indx = get_indx_last_smaller_or_equal(apc_tt_seq[key], seq_num);
+  if (val_indx == -1) {
+    debug_apc(key,rid,opnum,value,"cannot find val_indx=-1");
+    STOP_SW(apc_time);
+    return false;
+  }
+
+  // we cannot even get such an update operation
+  if (seq_num != apc_tt_seq[key][val_indx]) {
+    debug_apc(key,rid,opnum,value,"seq_num doesn't matching");
+    STOP_SW(apc_time);
+    return false;
+  }
+  // the values are different
+  if (value != apc_tt_vals[key][val_indx]) {
+    debug_apc(key,rid,opnum,value,"values are different");
+    std::cout << "    should be: [" << apc_tt_vals[key][val_indx] << "]\n";
+    STOP_SW(apc_time);
+    return false;
+  }
+  STOP_SW(apc_time);
+
+  // if it is one failure op
+  if (apc_fail_op_list.find(std::to_string(rid) + "-" + std::to_string(opnum))
+      != apc_fail_op_list.end()) {
+    is_failure = true;
+  } else {
+    is_failure = false;
+  }
+
+  return true;
+}
+
+//======Initialization========
+
+void thread_init () {
+  // reset the flag
+  is_resource_req = false;
+  if (cheng_verification) {
+    veri_buf.str("");
+  }
+  cheng_assert(php_code_running == false);
+  php_code_running = true;
+  batch_size = 1;
+}
+
+void thread_end () {
+  cheng_assert(php_code_running == true);
+  php_code_running = false;
+  batch_size = 1;
+}
+
+//============================
+
+#ifdef CHENG_CYCLE_WAR_TUNING
+
+int rec_counter = 0;
+
+DEF_TSC_SW(ins_time);
+DEF_TSC_SW(ins_time_1);
+DEF_TSC_SW(ins_time_2);
+DEF_TSC_SW(ins_time_3);
+DEF_TSC_SW(ins_time_4);
+
+//#define I_START START_SW(ins_time)
+//#define I_END   STOP_SW(ins_time)
+
+#define I_START(n) START_SW(ins_time_##n)
+#define I_END(n)   STOP_SW(ins_time_##n)
+
+#define I_START_ \
+  do {\
+    if (rec_counter == 0) {\
+      START_SW(ins_time);\
+    }\
+    rec_counter++;\
+  } while(0)
+
+#define I_END_  \
+  do {\
+    rec_counter--;\
+    if (rec_counter == 0) {\
+      STOP_SW(ins_time);\
+    }\
+  } while(0)
+
+#endif
+
+DEF_SW(db_query);
+#ifdef CHENG_TIME_EVAL
+thread_local struct timeval vm_start_t;
+thread_local int64_t concat_time;
+
+
+
+DEF_SW(req_time);
+DEF_SW(multi_time);
+
+  #ifdef CHENG_COUNT_INS
+    // CHENG_COUNT_INS: count multi_ins number
+    //  call get_ins_counter/get_multi_ins_counter to get this
+
+    #define START do {multi_ins_counter++;} while(0)
+    #define END  ((void)0) 
+  
+  #else 
+    // normal CHENG_TIME_EVAL: calculate multi_ins time
+  
+    #define START START_SW(multi_time)
+    #define END   STOP_SW(multi_time)
+  
+  #endif
+
+std::mutex t_mtx;
+#else
+
+#define START ((void)0)
+#define END   ((void)0)
+
+#endif
+
+//==========DEBUG================
+#ifdef CHENG_INS_ONLY_DEBUG 
+std::ofstream debug_log;
+
+static void
+openDebugLog() {
+  debug_log.rdbuf()->pubsetbuf(0,0);
+  //debug_log.open("/tmp/debug.log", std::ofstream::app);
+  debug_log.open("/tmp/debug.log");
+}
+
+static void
+closeDebugLog() {
+  debug_log.close();
+
+}
+
+void write_to_debug_log(std::string symbol, std::string log) {
+  debug_log << "    [" << symbol << "] " <<  log << "\n";
+}
+#endif
+
+void cheng_fail(std::string file, int line) {
+    veri_buf.str("");
+    veri_buf.str("Orochi doesn't support this case");
+
+#ifdef CHENG_INS_DEBUG
+    debug_log << "file: " << file << " loc: " << line << "\n";
+#endif
+    if (without_crash) {
+#ifdef CHENG_INS_DEBUG
+      debug_log << "cheng_assert false, go without_crash\n";
+#endif
+      HHVM_FN(debug_print_backtrace)(); 
+      std::cout << "***FAIL*** on file: " << file << " loc: " << line << "\n";
+      raise_error("Orochi does not support");
+      //throw ExitException(31);
+    } else {
+      //HHVM_FN(debug_print_backtrace)(); 
+      std::ofstream f("/tmp/xx");
+      f << "***FAIL*** on file: " << file << " loc: " << line << "\n";
+      f.close();
+
+      std::cout << "***FAIL*** on file: " << file << " loc: " << line << "\n";
+
+      always_assert(false);
+    }
+}
+
+static inline void printFullStack (std::string prefix) {
+#ifdef CHENG_DEBUG_STACK 
+  debug_log << "  <<-----STACK------\n";
+  for (int i = 0; i < vmStack().count(); i++) {
+    debug_log << prefix << "    stack[" << i << "]("
+      << (vmStack().count() - i) << "): " << vmStack().indTV(i)->pretty()
+      << "  addr:" << vmStack().indTV(i) << "\n";
+  }
+  debug_log << "  >>---------------\n";
+#endif
+}
+
+#ifdef CHENG_PRINT_CF
+
+#undef AS_CF
+#define AS_CF     print_cf() 
+
+static inline void print_ins(std::string name) {}
+
+static inline void print_cf() {
+  debug_log << "=-= [" << ins_counter++ << "] JMP";
+  auto func = vmfp()->m_func;
+  if (func!=nullptr) {
+    debug_log <<  "     (" << func->fullName()->toCppString() << ")";
+  }
+  auto vm = &*g_context;
+  if (vm!=nullptr) { 
+    debug_log << "  { " << vm->getContainingFileName()->toCppString()
+      << " : " << vm->getLine() << "}";
+  }
+  debug_log << " =-=\n";
+}
+
+
+#else
+
+static inline void print_ins (std::string name) {
+#ifdef CHENG_INS_ONLY_DEBUG
+  if (should_count) {
+    //auto tid = std::this_thread::get_id();
+    debug_log << "=-= [" << ins_counter++ << "] " << name;
+    auto func = vmfp()->m_func;
+    if (func!=nullptr) {
+      debug_log <<  "     (" << func->fullName()->toCppString() << ")";
+    }
+    auto vm = &*g_context;
+    if (vm!=nullptr) { 
+      debug_log << "  { " << vm->getContainingFileName()->toCppString()
+        << " : " << vm->getLine() << "}";
+    }
+    debug_log << " SM:[" << nested_ins_level << "]";
+    debug_log << " =-=\n";
+  }
+#endif
+}
+#endif
+
+std::unordered_set<std::string> bypass_func = {
+  // API:
+  "add_multi",
+  "is_multi",
+  "is_single_mode_on",
+  "split_multi",
+  "merge_multi",
+  "array_set_multi",
+  "array_sys_unset",
+  "veri_dump_output",
+  "ttdb_query",
+  "ttdb_query_mysqli_result",
+  "loop_var_capture",
+  "loop_var_end",
+  "MIC_to_MC",
+  "MC_to_MIC",
+  "getIthVal",
+  // support multivalue args
+  "print_r",
+  "print_p",
+  "session_decode",
+  "func_get_args",
+  "preg_replace_callback",
+  "current",
+  "array_key_exists",
+  // db
+  "multi_mysql_free_result",
+  "ttdb_multi_query",
+  "multi_mysql_fetch_object",
+  "multi_mysql_fetch_array",
+  "multi_mysql_data_seek",
+  "multi_mysql_field_seek",
+  "multi_mysql_fetch_field",
+  // apc
+  "oro_apc_store_check",
+  "oro_apc_fetch_check",
+  "oro_apc_delete_check",
+  "oro_apc_inc_check",
+  "oro_apc_dec_check",
+  // for the closure/object with multivalue
+  "is_callable",
+  "method_exists",
+  "get_class"
+};
+
+ALWAYS_INLINE static bool
+isBypassFunc(const char* name) {
+  std::string fname(name);
+  auto found = bypass_func.find(fname);
+  if (found == bypass_func.end()) {
+    return false;
+  } else {
+    return true;
+  }
+}
+
+ALWAYS_INLINE static bool
+isSystemArr(TypedValue* tv) {
+  if (tv->m_type == KindOfRef) {
+    tv = tvToCell(tv);
+  }
+  if (tv->m_type == KindOfArray && tv->m_data.parr->withMulti()) {
+    return true; 
+  }
+  return false; 
+}
+
+static inline TypedValue* tvBoxMulti(TypedValue* boxee);
+static TypedValue splitElements(TypedValue* orig, int size) {
+  TypedValue ret;
+
+  switch (orig->m_type) {
+  case KindOfResource:
+  case KindOfMulti:
+  case KindOfClass:
+    std::cout << "Do not support to split these elements\n";
+    cheng_assert(false);
+    break;
+  case KindOfRef:
+    // deref, split it, and return the multi-ref
+    {
+      TypedValue *cell = orig->m_data.pref->tv();
+      // if the ref is point to single element, split it!
+      // And this will generate ref->multi 
+      if (cell->m_type != KindOfMulti) {
+        cheng_assert(cell->m_type != KindOfRef); // cannot be nested ref
+        TypedValue tmp = splitElements(cell, size);
+        // make the multi-val to ref
+        tvBoxMulti(&tmp);
+        tvCopy(tmp, *cell);
+      } // or itself is a multi-val
+      ret = *cell;
+    }
+  case KindOfInt64:
+  case KindOfBoolean:
+  case KindOfDouble:
+  case KindOfUninit:
+  case KindOfNull:
+    ret = MultiVal::makeMultiVal();
+    for (int i=0; i<size; i++) {
+      ret.m_data.pmulti->addValue(*orig);
+    }
+    break;
+  case KindOfStaticString:
+  case KindOfString:
+    ret = MultiVal::makeMultiVal();
+    for (int i=0; i<size; i++) {
+      ret.m_data.pmulti->addValue(*orig);
+    }
+    break;
+  case KindOfArray:
+    ret = MultiVal::splitArray(*orig, size);
+    break;
+  case KindOfObject:
+    ret = MultiVal::splitObject(*orig, size);
+    break;
+  }
+
+  return ret;
+}
+
+static void apply2Elem (TypedValue* tv, std::function<void (TypedValue*)> f) {
+  TypedValue * cell = nullptr;
+  switch (tv->m_type) {
+  case KindOfRef:
+    cell = tvToCell(tv);
+    apply2Elem(cell, f);
+    break;
+  case KindOfInt64:
+  case KindOfBoolean:
+  case KindOfDouble:
+  case KindOfUninit:
+  case KindOfNull:
+  case KindOfStaticString:
+  case KindOfString:
+    f(tv);
+    break;
+  case KindOfResource:
+  case KindOfMulti:
+  case KindOfClass:
+    f(tv);
+    break;
+  case KindOfArray:
+    f(tv);
+    //for (ArrayIter iter(*tv); iter; ++iter) {
+    //  apply2Elem((TypedValue*)iter.nvSecond(), f);
+    //}
+    break;
+  case KindOfObject:
+    // FIXME: I do not go through all the elements in object
+    f(tv);
+    break;
+  default:
+    // for unknown element, we don't really care
+    break;
+  }
+}
+
+static void iterGlobalVar( std::function<void (TypedValue*)> f) {
+  auto globals = g_context->m_globalVarEnv;
+  Array all_var = globals->getDefinedVariables();
+  for (ArrayIter iter(all_var); iter; ++iter) {
+    apply2Elem((TypedValue*)iter.nvSecond(), f);
+  }
+}
+
+// FIXME: this is not enough, apparently
+static void iterLocalVar ( std::function<void (TypedValue*)> f) {
+  auto fp_ptr = vmfp();
+  do {
+    // local variables
+    auto num_local = fp_ptr->func()->numLocals();
+    for (int i = 0; i < num_local; i++) {
+      TypedValue* local = frame_local(fp_ptr, i);
+#ifdef CHENG_INS_DEBUG
+    debug_log << "    handling " << local->pretty() << "\n"; 
+#endif
+      apply2Elem(local,f);
+    }
+    // return values; NOTE: all the frames on the stack are not returned yet
+    // apply2Elem(&fp_ptr->m_r, f);
+
+    // maybe new obj value
+    if (fp_ptr->isFromFPushCtor()) {
+      auto prev_tv_of_fp = (TypedValue*)(fp_ptr+1);
+      apply2Elem(prev_tv_of_fp, f);
+    }
+
+    // prev call frame
+    fp_ptr = fp_ptr->m_sfp;
+  } while (fp_ptr!=nullptr);
+}
+
+static void dumpTV(TypedValue *tv) {
+  int8_t *b_ptr = (int8_t*)tv;
+  std::cout << "    64: " << *(int64_t *)b_ptr << "\n"
+    << "    8:  " << (int)b_ptr[8] << "\n"
+    << "    8:  " << (int)b_ptr[9] << "\n"
+    << "    8:  " << (int)b_ptr[10] << "\n"
+    << "    8:  " << (int)b_ptr[11] << "\n"
+    << "    32: " << *(int32_t *)&b_ptr[12] << "\n";
+}
+
+// NOTE: this is return Cell instead of Cell*
+inline Cell tvMayMultiToCell(TypedValue* tv) {
+  cheng_assert(tv->m_type == KindOfMulti);
+  if (tv->m_data.pmulti->getType() == KindOfRef) {
+    TypedValue ret = MultiVal::makeMultiVal();
+    for (auto it : *tv->m_data.pmulti) {
+      ret.m_data.pmulti->addValue(*tvToCell(it));
+    }
+    return ret;
+  } else {
+    return *tv;
+  }
+}
+
+static bool 
+is_loop_exit(TypedValue *val, int index, bool jump_forward, Op op) {
+  cheng_assert(loop_capture_mode);
+  cheng_assert(val->m_type == KindOfMulti);
+
+  auto tv = val->m_data.pmulti->getByVal(index);
+  bool equal_zero = false;
+  if (tv->m_type == KindOfInt64 || tv->m_type == KindOfBoolean) {
+    equal_zero = (tv->m_data.num == 0);
+  } else {
+    equal_zero = !toBoolean(cellAsCVarRef(*tv));
+  }
+
+  // first check the op
+  bool jump = false;
+  if (op == OpJmpZ) {
+    jump = equal_zero;
+  } else if (op == OpJmpNZ) {
+    jump = !equal_zero;
+  } else {
+    cheng_assert(false);
+  }
+
+  if ( (jump && jump_forward) || 
+       (!jump && !jump_forward) )
+  {
+    return true;
+  } else {
+    return false;
+  }
+}
+
+//--------Performance Replacement-----------
+// There are good software enginering function,
+// but we want PERFORMANCE!!!
+
+// See multi-val.cpp
+ALWAYS_INLINE struct TypedValue 
+in_makeMultiVal() {
+  TypedValue v;
+  v.m_type = KindOfMulti;
+  v.m_data.pmulti = new (MM().smartMallocSizeLogged(sizeof(MultiVal)))
+    MultiVal(); 
+  return v;
+}
+
+// See multi-val.cpp
+ALWAYS_INLINE struct TypedValue 
+in_makeMultiVal(int size, DataType t) {
+  TypedValue v;
+  v.m_type = KindOfMulti;
+  v.m_data.pmulti = new (MM().smartMallocSizeLogged(sizeof(MultiVal)))
+    MultiVal(size); 
+  v.m_data.pmulti->setType(t);
+  return v;
+}
+
+static ALWAYS_INLINE void
+castToStringInPlace(TypedValue* v) {
+  cheng_assert(v->m_type == KindOfStaticString);
+  auto str_ptr = v->m_data.pstr;
+  v->m_type = KindOfString;
+  v->m_data.pstr = StringData::Make(str_ptr, CopyString);
+  tvRefcountedIncRef(v); 
+}
+
+ALWAYS_INLINE void
+in_adjust_type(MultiVal* mv) {
+  int size = mv->valSize();
+
+  for (int i = 0; i < size; i++) {
+    auto m_multi_type = mv->getType();
+    auto adding_val = mv->getByVal(i);
+
+    // some casting:
+    //  int => Double
+    if (m_multi_type == KindOfDouble && adding_val->m_type == KindOfInt64) {
+      tvCastToDoubleInPlace(adding_val);
+    }
+    else if (m_multi_type == KindOfString && adding_val->m_type == KindOfStaticString) {
+      castToStringInPlace(adding_val);
+    }
+
+    // promote the multi-val from Int to Double
+    if (m_multi_type == KindOfInt64 && adding_val->m_type == KindOfDouble) {
+      // change the previous Int into Double
+      for (int i = 0; i < mv->valSize(); i++) {
+        tvCastToDoubleInPlace(mv->getByVal(i));
+      }
+      mv->setType(KindOfDouble);
+      m_multi_type = KindOfDouble;
+    }
+    // promote the multi-val from StaticString to String
+    else if (m_multi_type == KindOfStaticString && adding_val->m_type == KindOfString) {
+      // change the previous StaticString to String
+      for (int i = 0; i < mv->valSize(); i++) {
+        castToStringInPlace(mv->getByVal(i));
+      }
+      mv->setType(KindOfString);
+      m_multi_type = KindOfString;
+    }
+
+    // if m_multi_type is KindOfUninit, we accept NULL/Uninit and whatever
+    // if m_multi_type is decided, we accept NULL/Uninit and THAT TYPE
+#ifdef CHENG_CHECK
+    if ( m_multi_type != KindOfUninit
+         && (adding_val->m_type != KindOfUninit && adding_val->m_type != KindOfNull) 
+         && m_multi_type != adding_val->m_type) {
+      TypedValue tmp;
+      tmp.m_type = KindOfMulti;
+      tmp.m_data.pmulti = mv;
+      std::cout << "\n   === AddValue Warning ===\nOriginal MultiVal:\n";
+      HHVM_FN(print_r)(tvAsVariant(&tmp));
+      std::cout << "\nAdding element:\n    " << adding_val->pretty() << "\n";
+    }
+
+    // Allow NULL with other data
+    always_assert(m_multi_type == KindOfUninit ||  m_multi_type == KindOfNull ||
+                  m_multi_type == adding_val->m_type || adding_val->m_type == KindOfNull || adding_val->m_type == KindOfUninit);
+
+#endif
+    if ((m_multi_type == KindOfUninit || m_multi_type == KindOfNull) 
+        && (adding_val->m_type != KindOfUninit && adding_val->m_type != KindOfNull) ) {
+      mv->setType(adding_val->m_type);
+    }
+  }
+}
+
+
+//---------------helper functions, others may use------------
+bool cheng_cellToBool(Cell *cell) {
+  switch (cell->m_type) {
+    case KindOfUninit:
+    case KindOfNull:          return false;
+    case KindOfBoolean:       return cell->m_data.num;
+    case KindOfInt64:         return cell->m_data.num != 0;
+    case KindOfDouble:        return cell->m_data.dbl != 0;
+    case KindOfStaticString:
+    case KindOfString:        return cell->m_data.pstr->toBoolean();
+    case KindOfArray:         return !!cell->m_data.parr->size();
+    case KindOfObject:        return cell->m_data.pobj->toBoolean();
+    case KindOfResource:      return cell->m_data.pres->o_toBoolean();
+    case KindOfMulti:         cheng_assert(false); return false;
+    case KindOfRef:
+    case KindOfClass:         break;
+  }
+  not_reached();
+}
+
+//===========================================
+//===========================================
 
 // Identifies the set of return helpers that we may set m_savedRip to in an
 // ActRec.
@@ -273,7 +1745,8 @@ template<class T> T decode_oa(PC& pc) {
 
 static inline Class* frameStaticClass(ActRec* fp) {
   if (fp->hasThis()) {
-    return fp->getThis()->getVMClass();
+    // cheng-hack:
+    return fp->getThisDefault()->getVMClass();
   } else if (fp->hasClass()) {
     return fp->getClass();
   } else {
@@ -596,6 +2069,41 @@ Stack::requestInit() {
     RuntimeOption::EvalVMStackElms - sSurprisePageSize / sizeof(TypedValue);
   assert(!wouldOverflow(maxelms - 1));
   assert(wouldOverflow(maxelms));
+  // cheng-hack: open the debug log
+  thread_init();
+  flush_clock_cpu_time();
+#ifdef CHENG_INS_ONLY_DEBUG
+  openDebugLog();
+#endif
+#ifdef CHENG_TIME_EVAL
+  START_SW(req_time);
+  ins_counter=0;
+  multi_ins_counter=0;
+#endif
+  if (UNLIKELY(!table_update_log_loaded)) {
+    load_table_update_log("/tmp/table_update.log");
+  }
+  if (UNLIKELY(!apc_log_loaded)) {
+    load_apc_log("/tmp/apc.log");
+  }
+  if (UNLIKELY(!sess_log_loaded)) {
+    load_sess_log("/tmp/sess.log");
+  }
+  if (UNLIKELY(!opmap_loaded)) {
+    load_opmap("/tmp/opmap.mem");
+  }
+  if (UNLIKELY(!maxop_loaded)) {
+    load_maxop("/tmp/maxop.log");
+  }
+  // turn off single_mode_on
+  nested_ins_level = 0;
+  nested_ins_level = false;
+#ifdef CHENG_INS_ONLY_DEBUG
+    debug_log << "reqinit: single_mode_on = false\n";
+#endif
+  single_mode_cur_iter = -1;
+  single_mode_size = -1;
+  CLEAR_CLASSIFY_INS_COUNTER;
 }
 
 void
@@ -674,6 +2182,9 @@ static std::string toStringElm(const TypedValue* tv) {
   case KindOfResource:
     os << "C:";
     break;
+  case KindOfMulti:
+    os << "M:";
+    break;
   }
 
   do {
@@ -737,6 +2248,10 @@ static std::string toStringElm(const TypedValue* tv) {
     case KindOfClass:
       os << tv->m_data.pcls
          << ":" << tv->m_data.pcls->name()->data();
+      continue;
+    // TODO(cheng): need a implementation
+    case KindOfMulti:
+      os << "multivalue!";
       continue;
     }
     not_reached();
@@ -805,7 +2320,8 @@ static void toStringFrame(std::ostream& os, const ActRec* fp,
   std::string funcName(func->fullName()->data());
   os << "{func:" << funcName
      << ",soff:" << fp->m_soff
-     << ",this:0x" << std::hex << (fp->hasThis() ? fp->getThis() : nullptr)
+     // cheng-hack: I don't really care the toStringFrame
+     << ",this:0x" << std::hex << (fp->hasThis() ? fp->getThisDefault() : nullptr) 
      << std::dec << "}";
   TypedValue* tv = (TypedValue*)fp;
   tv--;
@@ -1215,6 +2731,29 @@ ObjectData* ExecutionContext::initObject(StringData* clsName,
   return initObject(loadClass(clsName), params, o);
 }
 
+// cheng-hack:
+// This is for multi_mysql_fetch_object()
+sptr<std::vector<ObjectData*> >
+ExecutionContext::initObject_multi(StringData* className,
+                             const Variant& params,
+                             sptr< std::vector<ObjectData*> > o_arr) {
+  auto class_ = loadClass(className);
+  auto ctor = class_->getCtor();
+  if (!(ctor->attrs() & AttrPublic)) {
+    std::string msg = "Access to non-public constructor of class ";
+    msg += class_->name()->data();
+    throw Object(Reflection::AllocReflectionExceptionObject(msg));
+  }
+  // call constructor
+  if (!isContainerOrNull(params)) {
+    throw_param_is_not_container();
+  }
+  TypedValue ret;
+  invokeFunc(&ret, ctor, params, nullptr, nullptr, nullptr, nullptr, InvokeNormal, o_arr);
+  tvRefcountedDecRef(&ret);
+  return o_arr;
+}
+
 ObjectData* ExecutionContext::initObject(const Class* class_,
                                          const Variant& params,
                                          ObjectData* o) {
@@ -1247,7 +2786,8 @@ ObjectData* ExecutionContext::getThis() {
     if (!fp) return nullptr;
   }
   if (fp->hasThis()) {
-    return fp->getThis();
+    // cheng-hack: no choice, but crash when meet multi
+    return fp->getThisSingle();
   }
   return nullptr;
 }
@@ -1626,17 +3166,27 @@ static bool prepareArrayArgs(ActRec* ar, const Cell args,
 
   assert(!ar->hasExtraArgs());
 
-  assert(isContainer(args));
-  int nargs = nregular + getContainerSize(args);
+  // cheng-hack: if args is multi-value array, we should
+  //             make it array of multi-value
+  auto new_args = args;
+  if (UNLIKELY(args.m_type == KindOfMulti)) {
+    START;
+    AS_MCALL;
+    new_args = MultiVal::invertTransferArray(new_args);
+    END;
+  }
+
+  always_assert(isContainer(new_args));
+  int nargs = nregular + getContainerSize(new_args);
   assert(!ar->hasVarEnv() || (0 == nargs));
   if (UNLIKELY(ar->hasInvName())) {
-    shuffleMagicArrayArgs(ar, args, stack, nregular);
+    shuffleMagicArrayArgs(ar, new_args, stack, nregular);
     return true;
   }
 
   int nparams = f->numNonVariadicParams();
   int nextra_regular = std::max(nregular - nparams, 0);
-  ArrayIter iter(args);
+  ArrayIter iter(new_args);
   if (LIKELY(nextra_regular == 0)) {
     for (int i = nregular; iter && (i < nparams); ++i, ++iter) {
       TypedValue* from = const_cast<TypedValue*>(
@@ -1647,6 +3197,10 @@ static bool prepareArrayArgs(ActRec* ar, const Cell args,
       } else if (LIKELY(from->m_type == KindOfRef &&
                         from->m_data.pref->getCount() >= 2)) {
         refDup(*from, *to);
+      } else if (from->m_type == KindOfMulti &&
+                 from->m_data.pmulti->getType() == KindOfRef) {
+        // copy the multi-ref to the dst location
+        cellDup(*from, *to);
       } else {
         if (doCufRefParamChecks && f->mustBeRef(i)) {
           try {
@@ -1749,9 +3303,9 @@ static bool prepareArrayArgs(ActRec* ar, const Cell args,
     assert(hasVarParam);
     if (nparams == 0
         && nextra_regular == 0
-        && args.m_type == KindOfArray
-        && args.m_data.parr->isVectorData()) {
-      stack.pushArray(args.m_data.parr);
+        && new_args.m_type == KindOfArray
+        && new_args.m_data.parr->isVectorData()) {
+      stack.pushArray(new_args.m_data.parr);
     } else {
       PackedArrayInit ai(extra);
       if (UNLIKELY(nextra_regular > 0)) {
@@ -2061,16 +3615,17 @@ void ExecutionContext::invokeFunc(TypedValue* retptr,
                                   Class* cls /* = NULL */,
                                   VarEnv* varEnv /* = NULL */,
                                   StringData* invName /* = NULL */,
-                                  InvokeFlags flags /* = InvokeNormal */) {
+                                  InvokeFlags flags /* = InvokeNormal */,
+                                  sptr< std::vector<ObjectData*> > multi_this_ /*=NULL*/) {
   assert(retptr);
   assert(f);
   // If f is a regular function, this_ and cls must be NULL
-  assert(f->preClass() || f->isPseudoMain() || (!this_ && !cls));
+  assert(f->preClass() || f->isPseudoMain() || ( (!this_ || !multi_this_) && !cls));
   // If f is a method, either this_ or cls must be non-NULL
-  assert(!f->preClass() || (this_ || cls));
+  assert(!f->preClass() || ((this_ || multi_this_) || cls));
   // If f is a static method, this_ must be NULL
   assert(!(f->attrs() & AttrStatic && !f->isClosureBody()) ||
-         (!this_));
+         ((!this_ || !multi_this_)));
   // invName should only be non-NULL if we are calling __call or
   // __callStatic
   assert(!invName || f->name()->isame(s___call.get()) ||
@@ -2087,6 +3642,12 @@ void ExecutionContext::invokeFunc(TypedValue* retptr,
 
   if (this_ != nullptr) {
     this_->incRefCount();
+  }
+  // cheng-hack: inc refcount for obj
+  else if (multi_this_ != nullptr) {
+    for (auto it : *multi_this_) {
+      it->incRefCount();
+    }
   }
 
   // We must do a stack overflow check for leaf functions on re-entry,
@@ -2119,11 +3680,15 @@ void ExecutionContext::invokeFunc(TypedValue* retptr,
   ar->setReturnVMExit();
   ar->m_func = f;
   if (this_) {
-    ar->setThis(this_);
+    ar->setThisSingle(this_);
+  }
+  // cheng-hack:
+  else if (multi_this_) {
+    ar->setThisMulti(multi_this_);
   } else if (cls) {
     ar->setClass(cls);
   } else {
-    ar->setThis(nullptr);
+    ar->setThisSingle(nullptr);
   }
   auto numPassedArgs = cellIsNull(&args) ? 0 : getContainerSize(args);
   if (invName) {
@@ -2131,6 +3696,7 @@ void ExecutionContext::invokeFunc(TypedValue* retptr,
   } else {
     ar->setVarEnv(varEnv);
   }
+
   ar->initNumArgs(numPassedArgs);
 
 #ifdef HPHP_TRACE
@@ -2171,6 +3737,11 @@ void ExecutionContext::invokeFunc(TypedValue* retptr,
       );
       popVMState();
     };
+
+    // cheng-hack: just try to set the multi_this bit
+    if (UNLIKELY(multi_this_!=nullptr)) {
+      ar->setThisMulti(multi_this_);
+    }
 
     enterVM(ar, varEnv ? StackArgsState::Untrimmed : StackArgsState::Trimmed);
 
@@ -2257,6 +3828,7 @@ void ExecutionContext::invokeFuncFew(TypedValue* retptr,
       refDup(*from, *to);
     }
   }
+
 
   TypedValue retval;
   {
@@ -2439,13 +4011,23 @@ bool ExecutionContext::evalUnit(Unit* unit, PC& pc, int funcType) {
   assert((uintptr_t)&ar->m_func < (uintptr_t)&ar->m_r);
   Class* cls = liveClass();
   if (vmfp()->hasThis()) {
-    ObjectData *this_ = vmfp()->getThis();
+    // cheng-hack: this can be a bummer, check carefully
+    if (UNLIKELY(vmfp()->isMultiThis())) {
+      auto mthis_ = vmfp()->getThisMulti(); // cheng-hack: no idea
+      for (auto it : *mthis_) {
+        it->incRefCount();
+      }
+      ar->setThisMulti(mthis_);
+    } else {
+      // original case
+    ObjectData *this_ = vmfp()->getThisSingle(); // cheng-hack: no idea
     this_->incRefCount();
-    ar->setThis(this_);
+    ar->setThisSingle(this_);
+    }
   } else if (vmfp()->hasClass()) {
     ar->setClass(vmfp()->getClass());
   } else {
-    ar->setThis(nullptr);
+    ar->setThisSingle(nullptr);
   }
   Func* func = unit->getMain(cls);
   assert(!func->isCPPBuiltin());
@@ -2708,7 +4290,7 @@ bool ExecutionContext::evalPHPDebugger(TypedValue* retval,
   Class *functionClass = nullptr;
   if (fp) {
     if (fp->hasThis()) {
-      this_ = fp->getThis();
+      this_ = fp->getThisSingle(); // cheng-hack: no idea
     } else if (fp->hasClass()) {
       frameClass = fp->getClass();
     }
@@ -2782,7 +4364,7 @@ void ExecutionContext::enterDebuggerDummyEnv() {
   ActRec* ar = vmStack().allocA();
   ar->m_func = s_debuggerDummy->getMain();
   ar->initNumArgs(0);
-  ar->setThis(nullptr);
+  ar->setThisSingle(nullptr);
   ar->setReturnVMExit();
   vmfp() = ar;
   vmpc() = s_debuggerDummy->entry();
@@ -3008,10 +4590,34 @@ static inline void ratchetRefs(TypedValue*& result, TypedValue& tvRef,
   }
 }
 
+// cheng-hack: for staticEmptyArray check
+extern std::aligned_storage<
+  sizeof(ArrayData),
+  alignof(ArrayData)
+>::type s_theEmptyArray;
+
+inline bool
+checkStaticEmptyArray(TypedValue* tvp) {
+  if(tvToCell(tvp)->m_type == KindOfArray && 
+     (void*) tvToCell(tvp)->m_data.parr == (void*) &s_theEmptyArray)
+  {
+    return true;
+  }
+  return false;
+}
+
 struct MemberState {
   unsigned ndiscard;
   MemberCode mcode{MEL};
   TypedValue* base;
+  // cheng-hack:
+  // used to check which is good: base or base_list
+  //   false: normal case
+  //   true: base will store the very first base, in order to provide the mapping
+  bool isMultiBase;
+  bool isVGetM;
+  sptr< std::vector<TypedValue*> > base_list; // ONLY used for multiVal
+  TypedValue* orig_base;
   TypedValue scratch;
   TypedValue literal;
   Variant ref;
@@ -3037,6 +4643,12 @@ OPTBLD_INLINE bool memberHelperPre(PC& pc, MemberState& mstate) {
   // PC needs to be advanced before we do anything, otherwise if we
   // raise a notice in the middle of this we could resume at the wrong
   // instruction.
+
+  // cheng: prepare for the isMultiIndex but !isMultiBase
+  auto init_pc = pc;
+  auto init_vec = vec;
+  bool read_multi_indx_from_single_base = false;
+multi_index_start:
   pc += immVec.size() + sizeof(int32_t) + sizeof(int32_t);
 
   if (!setMember) {
@@ -3058,6 +4670,7 @@ OPTBLD_INLINE bool memberHelperPre(PC& pc, MemberState& mstate) {
   TypedValue* pname;
   tvWriteUninit(&mstate.scratch);
 
+  // find the base
   switch (lcode) {
   case LNL:
     loc = frame_local_inner(vmfp(), decodeVariableSizeImm(&vec));
@@ -3150,22 +4763,383 @@ OPTBLD_INLINE bool memberHelperPre(PC& pc, MemberState& mstate) {
     break;
   case LH:
     assert(vmfp()->hasThis());
+    // cheng-hack: provide multi this support
+    if (UNLIKELY(vmfp()->isMultiThis())) {
+#ifdef CHENG_INS_DEBUG
+      debug_log << "    We encounter multi-this as base\n";
+#endif
+      mstate.scratch = genMultiVal(vmfp()->getThisMulti());
+      loc = &mstate.scratch;
+    } else {
+#ifdef CHENG_INS_DEBUG
+      debug_log << "    We encounter this as base\n";
+#endif
+      // normal case
     mstate.scratch.m_type = KindOfObject;
-    mstate.scratch.m_data.pobj = vmfp()->getThis();
+    mstate.scratch.m_data.pobj = vmfp()->getThisSingle(); // cheng-hack: should be single
     loc = &mstate.scratch;
+    }
     break;
 
   case InvalidLocationCode:
     not_reached();
   }
 
+  // base found, save to mstate.base
   mstate.base = loc;
   tvWriteUninit(&mstate.literal);
   tvWriteUninit(mstate.ref.asTypedValue());
   tvWriteUninit(mstate.ref2.asTypedValue());
 
+  // Used to be a BUG. Why do we need deref? but original doesn't?
+  if (UNLIKELY(mstate.base->m_type == KindOfRef)) {
+    mstate.base = tvToCell(mstate.base);
+  }
+  // We check if mutli-to-one-ref-or-obj happen
+  if (UNLIKELY(mstate.base->m_type == KindOfMulti &&
+               (mstate.base->m_data.pmulti->getType() == KindOfRef ||
+                mstate.base->m_data.pmulti->getType() == KindOfObject))) {
+    TypedValue* first_elem = tvToCell(mstate.base->m_data.pmulti->getByVal(0));
+    // check if we have same ret
+    bool found_same_ref_obj = true;
+    for (int i=1; i<mstate.base->m_data.pmulti->valSize(); i++) {
+      if (first_elem->m_data.num != tvToCell(mstate.base->m_data.pmulti->getByVal(i))->m_data.num) {
+        found_same_ref_obj = false; break;
+      }
+    }
+    // if mstate.base point to one obj/ref, shrink it
+    if (found_same_ref_obj) {
+      mstate.base = first_elem;
+#ifdef CHENG_INS_ONLY_DEBUG
+      debug_log << "   memberHelperPre: found_same_ref_obj, shrink to one\n";
+#endif
+    }
+  }
+
+  // cheng-hack:
+  // ASSUME: only the base can be multi-value
+  // EXCEPT: the base is a system array (e.g. $_SERVER)
+  auto base = mstate.base;
+  auto base_type = base->m_type;
+  bool isMultiBase = (base_type == KindOfMulti);
+  bool isMultiIndex = false;
+  bool isMultiInternal = false;
+
+  // (1) Preserve the initial environment 
+  // (2) Iterate the value in multiVal and collect the result
+  // (3) Use mstate.base_list instead of base (except for CGetM which set the saveResult)
+
+  // curtis:
+  mstate.orig_base = mstate.base;
+
+  // Prepare for multi cascading indexing
+  int iter_counter = 0, multi_size = 0;
+  // these two field of mstate is tricky, since mstate will be reset several times
+  mstate.isMultiBase = isMultiBase;
+
+  struct MemberState orig_mstate;
+
+  // remember all the pointer inside the struct is point to the original
+  // memory slots, which may be messed up after one iteration.
+  // If you have any BUG, please check here to see if you are using
+  // any pointer in orig_mstate which can be really bad idea.
+  // we have to do it here, for case multi-index-single-base
+  memcpy(&orig_mstate, &mstate, sizeof(struct MemberState) );
+
+  // save the original variables
+  const uint8_t* orig_vec = vec;
+  int orig_depth = depth; 
+
+  // single_mode_on:
+  // There are two things: (1) base is multi, (2) index is multi
+  if (UNLIKELY(single_mode_on)) {
+#ifdef CHENG_INS_DEBUG
+    debug_log << "    In single mode, mode iter: " << single_mode_cur_iter << "\n";
+#endif
+    if (isMultiBase && mstate.scratch.m_type == KindOfMulti) {
+      // NOTE: this is the only case which scratch is non-trival:
+      // We got a multi-this as the base
+      TypedValue *nexttv = orig_mstate.base->m_data.pmulti->getByVal(single_mode_cur_iter);
+      tvCopy(*nexttv, mstate.scratch);
+      mstate.base = &mstate.scratch;
+    } else if (isMultiBase) {
+      // other cases
+      mstate.base = orig_mstate.base->m_data.pmulti->getByVal(single_mode_cur_iter);
+    }
+    mstate.isMultiBase = false;
+    isMultiBase = false;
+  }
+
+  // NOTE2: multi-to-one-obj problem & multi-array-same-slot problem
+  // for multi-array-same-slot problem, there are three cases:
+  //  -- the return values are from a multi-array (might have point to the same array,
+  //  lazy copy), which should not shrink to one.
+  //  -- the return values are from a single-array with multi-array-single-obj as parent,
+  //  which should shrink to one (so that it will be OK for GetM, but will be split by SetM)
+  static std::vector<void*> iter_last_obj_ref;
+
+multi_begin:
+  if (UNLIKELY(isMultiBase || isMultiIndex || isMultiInternal)) {
+
+    static TypedValue read_result = {0}; // used for CGetM only (saveResult)
+    static sptr< std::vector<TypedValue*> > multi_base_ptr = nullptr;
+
+    // initialization
+    if (iter_counter == 0) {
+      START;
+      AS_MMEMBER;
+#ifdef CHENG_INS_ONLY_DEBUG
+      if (isMultiBase) {
+        debug_log << "  Cascading Indexing meets a multi-base\n";
+#ifdef CHENG_INS_DEBUG
+        debug_log << "     multiVal is:\n" << mstate.base->m_data.pmulti->dump("    ");
+#endif
+      } else if (isMultiIndex) {
+        debug_log << "    Single-base multi-index\n";
+      } else if (isMultiInternal) {
+        debug_log << "    Single-base multi-value\n";
+      }
+#endif
+      // isMultiInternal for the case $obj->multi_arr
+      if (isMultiBase || isMultiInternal) {
+        multi_size = mstate.base->m_data.pmulti->valSize();
+        orig_vec = vec;
+        orig_depth = depth; 
+        /*
+         * In order to fix the following case:
+         *   $new_arr = $old_multi_arr;
+         *   unset($new_arr[0]); // or any other write 
+         * This may affect the $old_multi_arr, since the multi-array ref is >1,
+         * but the array within multival might be still 1.
+         */
+        if (UNLIKELY(setMember && isMultiBase)) {
+          auto pmulti = mstate.base->m_data.pmulti;
+          if (pmulti->getType() == KindOfArray &&
+              pmulti->getCount() > 1 /*&&
+              pmulti->getByVal(0)->m_data.parr->getCount() == 1*/) {
+            // used to be a performance BUG: clone will not be freed
+            // Actually, clone will not solve the problem either!
+            //*mstate.base = MultiVal::cloneMultiVal(mstate.base);
+
+            // TODO: need to check the correctness of following code
+            // current solution, add all array within by 1:
+            auto tmp = in_makeMultiVal(pmulti->valSize(), KindOfUninit);
+            cheng_assert(multi_size==pmulti->valSize());
+            for(int i=0; i<multi_size; i++) {
+              tvDup(*pmulti->getByVal(i), *tmp.m_data.pmulti->getByVal(i));
+            }
+            in_adjust_type(tmp.m_data.pmulti);
+            *mstate.base = tmp;
+          }
+        }
+      }
+      cheng_assert(multi_size != 0);
+
+      if (multi_base_ptr != nullptr) {
+        multi_base_ptr->clear();
+      } else {
+        multi_base_ptr = std::make_shared< std::vector<TypedValue*> >();
+      }
+      read_result = in_makeMultiVal(multi_size, KindOfUninit);
+
+      // This is for finding multi value (MultiInternal) in the middle of the procedure.
+      // copy current environment, if we find multi during loop
+      if (!isMultiBase && isMultiInternal) {
+        mstate.isMultiBase = true;
+        memcpy(&orig_mstate, &mstate, sizeof(struct MemberState) );
+      }
+      // This is for finding multi-index in the middle of the procedure.
+      // If isMultiIndex ONLY, then
+      // Must be: (1) read (2) return NULL
+      // copy current environment
+      if (!isMultiBase && !isMultiInternal && isMultiIndex) {
+        cheng_assert(!setMember); // must be read
+        read_multi_indx_from_single_base = true; // must be NULL
+        // collect all the results
+        mstate.isMultiBase = true;
+        memcpy(&orig_mstate, &mstate, sizeof(struct MemberState) );
+      }
+
+      // if(setMember):
+      // if !isMultiBase && isMultiIndex, it should be split during
+      // finding the isMultiIndex, then isMultiBase should = true.
+      // Never (!isMultiBase && isMultiIndex)
+      if (setMember) {
+        cheng_assert( (!isMultiBase && isMultiIndex) == false);
+      }
+
+      // see NOTE2
+      // since this is static variable (for performance reason), we clear first
+      iter_last_obj_ref.clear();
+    } else {
+      // after at lease one iteration
+      // collect the result
+#ifdef CHENG_INS_DEBUG
+      debug_log << "  Round[" << iter_counter << "], result is:" 
+        << mstate.base->pretty() << "\n";
+#endif
+      if (saveResult) {
+        // CGetM, if we have seen a ref, we should deref here! (Why?)
+        // Because: like cgetl, they need deref.
+        //read_result.m_data.pmulti->addValue(*tvToCell(mstate.base));
+        tvDup(*tvToCell(mstate.base), *read_result.m_data.pmulti->getByVal(iter_counter-1));
+      } else {
+        // Others
+        if (mstate.base == &mstate.scratch) {
+          // Used to be a BUG, that only the last obj is modified, since
+          // the base pointer of obj is point to the TypedValue mstate.scratch
+          cheng_assert(orig_mstate.scratch.m_type == KindOfMulti);
+          auto cur_this = orig_mstate.scratch.m_data.pmulti->getByVal(iter_counter-1);
+          multi_base_ptr->push_back(cur_this);
+        } else {
+          multi_base_ptr->push_back(mstate.base);
+        }
+#ifdef CHENG_CHECK
+        // FIXME: is this universeal truth?
+        if ((*multi_base_ptr)[0]->m_type != mstate.base->m_type) {
+          std::cout << "Different types, used to be " << (*multi_base_ptr)[0]->pretty() 
+            << " and now is " << mstate.base->pretty() << "\n";
+          cheng_assert(false);
+        }
+#endif
+      }
+    }
+
+    // check if the end
+    if (iter_counter >= multi_size) {
+      // end of the cascading indexing, mstate is the one who return value
+      // if saveResult, save the result to scratch
+      if (saveResult) {
+        in_adjust_type(read_result.m_data.pmulti);
+        // decide the type
+        // check if the results are the same, shrink them if true
+        auto single = read_result.m_data.pmulti->shrinkToSingle();
+        // assert the return values are all NULL
+        if (read_multi_indx_from_single_base) {
+          cheng_assert(single != nullptr);
+          cheng_assert(single->m_type == KindOfNull || single->m_type == KindOfUninit); 
+        }
+        if (single == nullptr) {
+          tvCopy(read_result, mstate.scratch);
+        } else {
+#ifdef CHENG_INS_DEBUG
+          debug_log << "    Shrink the result to single: " << single->pretty() << "\n";
+#endif
+          tvDup(*single, mstate.scratch);
+          // free the read_result
+          tvRefcountedDecRef(&read_result);
+        }
+      } else {
+        mstate.base_list = multi_base_ptr;
+        mstate.base = orig_mstate.base; // used for get the mapping 
+
+        // It is possible that we got the same "return base" from
+        // all iterations. For example:
+        //   $multi_arr[$s_obj_indx]->indx = $val;
+        // If the final results are the same, we should just return one value
+        // check NOTE2
+        cheng_assert(iter_last_obj_ref.size() == multi_size);
+        cheng_assert(multi_size >= 1);
+        // If we meet some ref/obj after multival
+        if (iter_last_obj_ref[0] != nullptr) {
+
+          bool same_path = true;
+          void* first_ref_obj = iter_last_obj_ref[0];
+          for (int i=1; i<multi_size; i++) {
+            if (first_ref_obj != iter_last_obj_ref[i]) {
+              same_path = false;
+              break;
+            }
+          }
+
+          // staticEmptyArray check: ref->empty_array which are all the same
+          // Solution: detect empty_array, and set found_path as false.
+          bool is_empty_arr = checkStaticEmptyArray(tvToCell((*mstate.base_list)[0]));
+          if (same_path && is_empty_arr) {
+            same_path = false;
+#ifdef CHENG_INS_ONLY_DEBUG
+            debug_log << "    found staticEmptyArray, set same_path to FALSE\n";
+#endif
+          }
+
+          // if same_path is true, we should have the same ret
+          if (same_path) {
+#ifdef CHENG_CHECK
+            // used to be a BUG: sometime the last elem is a Ref, need to deref
+            TypedValue* first_ret_elem = tvToCell((*mstate.base_list)[0]);
+            // check if we have same ret
+            bool found_same_ret = true;
+            for (int i=1; i<multi_size; i++) {
+              if (first_ret_elem->m_data.num != tvToCell((*mstate.base_list)[i])->m_data.num) {
+                found_same_ret = false; break;
+              }
+            }
+
+#ifdef CHENG_INS_ONLY_DEBUG 
+            if (!found_same_ret) {
+              debug_log << "    memberHelperPre: find same_path, but not same_ret!\n"
+                << "    same_path ptr: (" << first_ref_obj << ")\n"
+                << "    rets are:\n" ;
+              for (int i=0; i<multi_size; i++) {
+                debug_log << "      [" << i << "] " << tvToCell((*mstate.base_list)[i])->pretty() << "\n";
+              }
+            }
+#endif
+            cheng_assert(found_same_ret == same_path);
+#endif
+
+            // if we find a single obj shared by multi-container, we must make sure
+            // the following cascading indexing without any multi-index.
+            // e.g. $multi->single_obj[$multi_index] is prohibitive
+#ifdef CHENG_INS_ONLY_DEBUG
+            debug_log << "  the same path/ret is found, shrink to isMultiBase=false\n";
+#endif
+            cheng_assert(!isMultiIndex);
+            mstate.isMultiBase = false;
+            mstate.base = (*mstate.base_list)[0];
+          }
+        }
+      }
+
+      END;
+      return false;
+    }
+
+    // construct new mstate
+    memcpy(&mstate, &orig_mstate, sizeof(struct MemberState));
+    vec = orig_vec;
+    depth = orig_depth;
+    if (mstate.scratch.m_type == KindOfMulti) {
+      // NOTE: this is the only case which scratch is non-trival:
+      // We got a multi-this as the base
+      TypedValue *nexttv = orig_mstate.base->m_data.pmulti->getByVal(iter_counter);
+      tvCopy(*nexttv, mstate.scratch);
+      mstate.base = &mstate.scratch;
+    } else if (isMultiBase || isMultiInternal) {
+      // multi-index do not have multi-this
+      // other cases
+      mstate.base = orig_mstate.base->m_data.pmulti->getByVal(iter_counter);
+    }
+
+
+    iter_last_obj_ref.push_back(nullptr); // push nullptr as default
+    iter_counter++;
+  }
+
+  // cheng-hack:
+  // sys_arr may have multi-value elements
+  // e.g. $_FILES['paperUpload']['tmp_name']
+  // Three situations:
+  // (1) Good to go: finish the processing, either single value or multi-value at first layer
+  // (2) Re-initialize: find cascading indexing in multi-value of first layer
+  // (3) Next/End: already de-multiplexing, choose next value
+
   // Iterate through the members.
   while (vec < pc) {
+    // cheng-hack: save for recovery
+    auto loop_start_vec = vec;
+    auto loop_start_depth = depth;
+
     mstate.mcode = MemberCode(*vec++);
     if (memberCodeHasImm(mstate.mcode)) {
       int64_t memberImm = decodeMemberCodeImm(&vec, mstate.mcode);
@@ -3192,6 +5166,68 @@ OPTBLD_INLINE bool memberHelperPre(PC& pc, MemberState& mstate) {
         break;
       }
     }
+
+    // cheng-hack: choose the correct index here 
+    if (UNLIKELY(mstate.curMember && mstate.curMember->m_type == KindOfMulti)) {
+      if (UNLIKELY(single_mode_on)) {
+        mstate.curMember = mstate.curMember->m_data.pmulti->getByVal(single_mode_cur_iter);
+      } else if (!isMultiBase && !isMultiIndex && !isMultiInternal) {
+#ifdef CHENG_INS_ONLY_DEBUG
+        debug_log << "    find multi-index for single-base\n";
+#endif
+        // we find a multi-index on single-base 
+        // two cases:
+        //  if (setMember): we split the container, FIXME: do not support object so far
+        //  if (!setMember): the only case valid is return empty, FIXME: otherwise, fail
+        if (setMember) {
+#ifdef CHENG_INS_ONLY_DEBUG
+          debug_log << "    split the base (setMember==true)\n";
+#endif
+          multi_size = mstate.curMember->m_data.pmulti->valSize();
+          TypedValue *orig_base = mstate.orig_base;
+          // FIXME: need to track obj, do not support here
+          if (orig_base->m_type != KindOfArray) {
+            std::cout << "\n[ERROR] met a multi-index, for single base: "
+              <<  orig_base->pretty() << "\n";
+            cheng_assert(false);
+          }
+          TypedValue split_multi = MultiVal::splitArray(*orig_base, multi_size);
+          tvCopy(split_multi, *mstate.orig_base);
+          pc = init_pc;
+          vec = init_vec;
+          goto multi_index_start;
+        } else {
+          // $a = $single_obj[$multi_ind]
+          // NULL is the only option!
+#ifdef CHENG_INS_ONLY_DEBUG
+          debug_log << "    continue the base (setMember==false)\n";
+#endif
+          isMultiIndex = true;
+          multi_size = mstate.curMember->m_data.pmulti->valSize();
+          orig_vec = loop_start_vec;
+          orig_depth = loop_start_depth;
+          goto multi_begin;
+        }
+      } else {
+        mstate.curMember = mstate.curMember->m_data.pmulti->getByVal(iter_counter-1);
+      }
+    }
+
+#ifdef CHENG_INS_DEBUG
+    auto ind_txt = HHVM_FN(print_r)(tvAsVariant(mstate.curMember), true);
+    debug_log << "    ---> index as [" << ind_txt.toString().toCppString() << "]\n";
+    //debug_log << "-------------------\n";
+    //HHVM_FN(print_r)(tvAsVariant(mstate.base));
+    //debug_log << ">>==============\n";
+#endif
+
+    /*
+    // FIXME: this is used for __get()/__set() with global variable
+    single_mode_on = true;
+    single_mode_cur_iter = iter_counter-1;
+    */
+    cheng_assert(mstate.curMember==nullptr || mstate.curMember->m_type != KindOfMulti);
+    cheng_assert(mstate.base->m_type != KindOfMulti);
 
     TypedValue* result;
     switch (mstate.mcode) {
@@ -3238,6 +5274,13 @@ OPTBLD_INLINE bool memberHelperPre(PC& pc, MemberState& mstate) {
       assert(false);
       result = nullptr; // Silence compiler warning.
     }
+
+    /*
+    // FIXME: this is used for __get()/__set() with global variable
+    single_mode_on = false;
+    single_mode_cur_iter = -1;
+    */
+
     assert(result != nullptr);
     ratchetRefs(result, *mstate.ref.asTypedValue(),
                 *mstate.ref2.asTypedValue());
@@ -3246,6 +5289,68 @@ OPTBLD_INLINE bool memberHelperPre(PC& pc, MemberState& mstate) {
         result->m_type == KindOfUninit) {
       return true;
     }
+
+#ifdef CHENG_INS_DEBUG
+    //auto txt = HHVM_FN(print_r)(tvAsVariant(result), true);
+    debug_log << "    ---> Intermediate Result: " << result->pretty() << "\n";
+    debug_log << "    ---> after derf : " << tvToCell(result)->pretty() << "\n";
+    debug_log << "    ---> after 2 derf : " << tvToCell(tvToCell(result))->pretty() << "\n";
+    //debug_log << "         {{" << txt.toString().toCppString() << "}}\n";
+#endif
+
+    // cheng-hack:
+    if (UNLIKELY(tvToCell(result)->m_type == KindOfMulti)) {
+      // Used to be a BUG: if we deref here, for the VGetM, there will be multiple-ref!
+      // correct version:
+      auto orig_result = result; // for VGetM
+      result = tvToCell(result);
+
+      if (UNLIKELY(single_mode_on)) {
+        result = result->m_data.pmulti->getByVal(single_mode_cur_iter);
+      } else if (!isMultiBase && !isMultiIndex && !isMultiInternal) {
+        // we find a multi-index on single-base  or multi-value on single-base
+        // first try to find out if we're going to continue the loop 
+        if (vec < pc) {
+          // if so, jump to multi_begin
+          isMultiInternal = true;
+          mstate.base = result;
+          goto multi_begin;
+        } else {
+#ifdef CHENG_INS_ONLY_DEBUG
+          debug_log << "    ---> get multi-value as result and quit\n"; 
+#endif
+          if (mstate.isVGetM) {
+            mstate.base = orig_result;
+          } else {
+            mstate.base = result;
+          }
+          break;
+        }
+      }
+      // not in single_Mode and (isMultiBase || isMultiIndex || isMultiInternal)
+      else
+      {
+        // find one multival, clear previous iter_last_obj_ref
+        cheng_assert(iter_last_obj_ref.size() == iter_counter);
+        iter_last_obj_ref[iter_counter-1] = nullptr;
+        // Can be: multi_arr->obj->multi_arr
+        // should not do deref! for cases like VGetM!
+        result = result->m_data.pmulti->getByVal(iter_counter-1);
+#ifdef CHENG_INS_ONLY_DEBUG
+        debug_log << "    ---> Multi-Result, get the result[" << iter_counter - 1 << "]: " << result->pretty() << "\n";
+#endif
+      }
+    } 
+    // for NOTE2: only happen when we're in iteration mode
+    else if (UNLIKELY(multi_size > 0)) {
+      // set iter_last_obj_ref
+      // FIXME: is it possible that ref->obj->[SAME ObjectData]?
+      if (result->m_type == KindOfRef || result->m_type == KindOfObject) {
+        cheng_assert(iter_last_obj_ref.size() == iter_counter); 
+        iter_last_obj_ref[iter_counter-1] = (void*)result->m_data.pobj; // save last met obj/ref
+      }
+    }
+
     mstate.base = result;
   }
 
@@ -3272,6 +5377,9 @@ OPTBLD_INLINE bool memberHelperPre(PC& pc, MemberState& mstate) {
       tvDup(*mstate.base, mstate.scratch);
     }
   }
+
+  // cheng-hack:
+  if (UNLIKELY(isMultiBase||isMultiIndex||isMultiInternal)) goto multi_begin;
 
   return false;
 }
@@ -3377,6 +5485,33 @@ OPTBLD_INLINE void setHelperPost(unsigned ndiscard) {
   vmStack().ndiscard(ndiscard);
 }
 
+/* cheng-hack:
+ * Used by VGetL/VGetN/VGetG/FPassL
+ * Here and VGetG is the only places where can generate Ref (aka. tvBox(...))
+ * Used by more places
+ *
+ * modify the reference in-place.
+ */
+static inline TypedValue* tvBoxMulti(TypedValue* boxee) {
+#ifdef CHENG_CHECK
+  cheng_assert(boxee->m_type == KindOfMulti);
+  cheng_assert(boxee->m_data.pmulti->getType() != KindOfRef);
+#endif
+#ifdef CHENG_INS_DEBUG
+  debug_log << "  Before VGetX:\n" << boxee->m_data.pmulti->dump("    ");
+#endif
+  // box each of the element in multiVal
+  for (auto it : *boxee->m_data.pmulti) {
+    tvBox(it);
+  }
+  // set the type to multiRef
+  boxee->m_data.pmulti->setType(KindOfRef);
+#ifdef CHENG_INS_DEBUG
+  debug_log << "  After VGetX:\n" << boxee->m_data.pmulti->dump("    ");
+#endif
+  return boxee;
+}
+
 // forward-declare iop functions.
 #define O(name, imm, push, pop, flags) void iop##name(PC& pc);
 OPCODES
@@ -3392,25 +5527,30 @@ OPTBLD_INLINE void iopHighInvalid(IOP_ARGS) {
   abort();
 }
 
+// Good to go
 OPTBLD_INLINE void iopNop(IOP_ARGS) {
   pc++;
 }
 
+// Good to go
 OPTBLD_INLINE void iopPopA(IOP_ARGS) {
   pc++;
   vmStack().popA();
 }
 
+// Good to go
 OPTBLD_INLINE void iopPopC(IOP_ARGS) {
   pc++;
   vmStack().popC();
 }
 
+// Good to go
 OPTBLD_INLINE void iopPopV(IOP_ARGS) {
   pc++;
   vmStack().popV();
 }
 
+// Good to go
 OPTBLD_INLINE void iopPopR(IOP_ARGS) {
   pc++;
   if (vmStack().topTV()->m_type != KindOfRef) {
@@ -3420,82 +5560,150 @@ OPTBLD_INLINE void iopPopR(IOP_ARGS) {
   }
 }
 
+// Good to go
 OPTBLD_INLINE void iopDup(IOP_ARGS) {
   pc++;
   vmStack().dup();
 }
 
+// Not impl 
 OPTBLD_INLINE void iopBox(IOP_ARGS) {
   pc++;
+#ifdef CHENG_CHECK
+  cheng_assert(vmStack().topTV()->m_type != KindOfMulti);
+#endif
   vmStack().box();
 }
 
+// Not impl 
 OPTBLD_INLINE void iopUnbox(IOP_ARGS) {
   pc++;
+#ifdef CHENG_CHECK
+  cheng_assert(vmStack().topTV()->m_type != KindOfMulti);
+#endif
   vmStack().unbox();
 }
 
+// Not impl
 OPTBLD_INLINE void iopBoxR(IOP_ARGS) {
   pc++;
   TypedValue* tv = vmStack().topTV();
+#ifdef CHENG_CHECK
+  cheng_assert(tv->m_type != KindOfMulti);
+#endif
   if (tv->m_type != KindOfRef) {
     tvBox(tv);
   }
 }
 
+// Not impl
 OPTBLD_INLINE void iopBoxRNop(IOP_ARGS) {
   pc++;
+#ifdef CHENG_CHECK
+  cheng_assert(vmStack().topTV()->m_type != KindOfMulti);
+#endif
   assert(refIsPlausible(*vmStack().topTV()));
 }
 
-OPTBLD_INLINE void iopUnboxR(IOP_ARGS) {
-  pc++;
-  if (vmStack().topTV()->m_type == KindOfRef) {
-    vmStack().unbox();
+// cheng: deref multi-ref
+ALWAYS_INLINE static
+void unboxMulti(TypedValue* tv) {
+#ifdef CHENG_CHECK
+  cheng_assert(tv->m_type == KindOfMulti);
+#endif
+  if (tv->m_data.pmulti->getType() == KindOfRef) {
+#ifdef CHENG_INS_DEBUG
+    debug_log << "    deref the multi-ref\n";
+#endif
+    // unbox a multi-ref
+    TypedValue ret = MultiVal::makeMultiVal();
+    for (auto it : *tv->m_data.pmulti) {
+      // addValue() will add the refcount for TV 
+      ret.m_data.pmulti->addValue(*tvToCell(it));
+    }
+    // decrease multi-ref's counter
+    tvDecRefMulti(tv);
+    // copy the newly multi to the right place
+    tvCopy(ret, *tv);
   }
 }
 
+// cheng-hack:
+OPTBLD_INLINE void iopUnboxR(IOP_ARGS) {
+  AS_MISC;
+  pc++;
+  auto type = vmStack().topTV()->m_type;
+  // This is a multi-ref
+  if (UNLIKELY(type == KindOfMulti)) {
+    START;
+    AS_MMISC;
+    TypedValue* tv = vmStack().topTV();
+#ifdef CHENG_INS_DEBUG
+    auto txt = HHVM_FN(print_r)(tvAsVariant(tv), true);
+    debug_log << "  UnboxR a multiVal, before unbox: " << tv->pretty() << " : {{"
+      << txt.toString().toCppString() << "}}\n";
+#endif
+    unboxMulti(tv);
+    END;
+  } else if (type == KindOfRef) {
+    // original case
+    vmStack().unbox();
+  }
+#ifdef CHENG_INS_DEBUG
+  debug_log << "    unboxr: " << vmStack().topTV()->pretty() << "\n";
+#endif
+}
+
+// Good to go
 OPTBLD_INLINE void iopUnboxRNop(IOP_ARGS) {
   pc++;
   assert(cellIsPlausible(*vmStack().topTV()));
 }
 
+// Good to go
 OPTBLD_INLINE void iopRGetCNop(IOP_ARGS) {
   pc++;
 }
 
+// Good to go
 OPTBLD_INLINE void iopNull(IOP_ARGS) {
   pc++;
   vmStack().pushNull();
 }
 
+// Good to go
 OPTBLD_INLINE void iopNullUninit(IOP_ARGS) {
   pc++;
   vmStack().pushNullUninit();
 }
 
+// Good to go
 OPTBLD_INLINE void iopTrue(IOP_ARGS) {
   pc++;
   vmStack().pushTrue();
 }
 
+// Good to go
 OPTBLD_INLINE void iopFalse(IOP_ARGS) {
   pc++;
   vmStack().pushFalse();
 }
 
+// Good to go
 OPTBLD_INLINE void iopFile(IOP_ARGS) {
   pc++;
   const StringData* s = vmfp()->m_func->unit()->filepath();
   vmStack().pushStaticString(const_cast<StringData*>(s));
 }
 
+// Good to go
 OPTBLD_INLINE void iopDir(IOP_ARGS) {
   pc++;
   const StringData* s = vmfp()->m_func->unit()->dirpath();
   vmStack().pushStaticString(const_cast<StringData*>(s));
 }
 
+// Good to go
 OPTBLD_INLINE void iopNameA(IOP_ARGS) {
   pc++;
   auto const cls  = vmStack().topA();
@@ -3504,32 +5712,39 @@ OPTBLD_INLINE void iopNameA(IOP_ARGS) {
   vmStack().pushStaticString(const_cast<StringData*>(name));
 }
 
+// Good to go
 OPTBLD_INLINE void iopInt(IOP_ARGS) {
   pc++;
   auto i = decode<int64_t>(pc);
   vmStack().pushInt(i);
 }
 
+// Good to go
 OPTBLD_INLINE void iopDouble(IOP_ARGS) {
   pc++;
   auto d = decode<double>(pc);
   vmStack().pushDouble(d);
 }
 
+// Good to go
 OPTBLD_INLINE void iopString(IOP_ARGS) {
   pc++;
   auto s = decode_litstr(pc);
   vmStack().pushStaticString(s);
 }
 
+// Good to go
 OPTBLD_INLINE void iopArray(IOP_ARGS) {
+  AS_ARR;
   pc++;
   auto id = decode<Id>(pc);
   ArrayData* a = vmfp()->m_func->unit()->lookupArrayId(id);
   vmStack().pushStaticArray(a);
 }
 
+// Good to go
 OPTBLD_INLINE void iopNewArray(IOP_ARGS) {
+  AS_ARR;
   pc++;
   auto capacity = decode_iva(pc);
   if (capacity == 0) {
@@ -3539,7 +5754,9 @@ OPTBLD_INLINE void iopNewArray(IOP_ARGS) {
   }
 }
 
+// Good to go
 OPTBLD_INLINE void iopNewMixedArray(IOP_ARGS) {
+  AS_ARR;
   pc++;
   auto capacity = decode_iva(pc);
   if (capacity == 0) {
@@ -3549,34 +5766,46 @@ OPTBLD_INLINE void iopNewMixedArray(IOP_ARGS) {
   }
 }
 
+// Good to go
 OPTBLD_INLINE void iopNewVArray(IOP_ARGS) {
+  AS_ARR;
   pc++;
   auto capacity = decode_iva(pc);
   // TODO(t4757263) staticEmptyArray() for VArray
   vmStack().pushArrayNoRc(MixedArray::MakeReserveVArray(capacity));
 }
 
+// Good to go
 OPTBLD_INLINE void iopNewMIArray(IOP_ARGS) {
+  AS_ARR;
   pc++;
   auto capacity = decode_iva(pc);
   // TODO(t4757263) staticEmptyArray() for IntMap
   vmStack().pushArrayNoRc(MixedArray::MakeReserveIntMap(capacity));
 }
 
+// Good to go
 OPTBLD_INLINE void iopNewMSArray(IOP_ARGS) {
+  AS_ARR;
   pc++;
   auto capacity = decode_iva(pc);
   // TODO(t4757263) staticEmptyArray() for StrMap
   vmStack().pushArrayNoRc(MixedArray::MakeReserveStrMap(capacity));
 }
 
+// Not Impl
 OPTBLD_INLINE void iopNewLikeArrayL(IOP_ARGS) {
+  AS_ARR;
   pc++;
   auto local = decode_la(pc);
   auto capacity = decode_iva(pc);
 
   ArrayData* arr;
   TypedValue* fr = frame_local(vmfp(), local);
+
+#ifdef CHENG_CHECK
+  cheng_assert(fr->m_type != KindOfMulti);
+#endif
 
   if (LIKELY(fr->m_type == KindOfArray)) {
     arr = MixedArray::MakeReserveLike(fr->m_data.parr, capacity);
@@ -3587,58 +5816,373 @@ OPTBLD_INLINE void iopNewLikeArrayL(IOP_ARGS) {
   vmStack().pushArrayNoRc(arr);
 }
 
+// curtis:
 OPTBLD_INLINE void iopNewPackedArray(IOP_ARGS) {
+  AS_ARR;
   pc++;
   auto n = decode_iva(pc);
-  // This constructor moves values, no inc/decref is necessary.
-  auto* a = MixedArray::MakePacked(n, vmStack().topC());
-  vmStack().ndiscard(n);
-  vmStack().pushArrayNoRc(a);
+ 
+  TypedValue *values = vmStack().topC();
+  bool multi_call = false;
+  bool is_multi[n];
+  memset(is_multi, 0, n*sizeof(bool));
+  int multival_num = 0, call_num = 0;
+
+  for (int i = 0; i < n; i++) {
+    auto const& src = values[i];
+    if (src.m_type == KindOfMulti) {
+      multi_call = true;
+      is_multi[i] = true;
+      multival_num++;
+      if (call_num == 0) call_num = src.m_data.pmulti->valSize();
+    }
+  } 
+
+  if (UNLIKELY(multi_call)) {
+    START;
+    AS_MARR;
+    TypedValue result = MultiVal::makeMultiVal();
+    auto multi = result.m_data.pmulti;
+
+    TypedValue orig_stack[n];
+    memcpy(orig_stack, values, sizeof(struct TypedValue)*n);
+    struct ActRec orig_ar;
+    memcpy(&orig_ar, vmfp(), sizeof(struct ActRec));
+    struct Stack orig_stack_ptr;
+    orig_stack_ptr = vmStack();
+ 
+    for (int call_counter = 0; call_counter < call_num; call_counter++) {
+      vmStack() = orig_stack_ptr;
+      memcpy(values, orig_stack, sizeof(struct TypedValue)*n);
+      memcpy(vmfp(), &orig_ar, sizeof(struct ActRec));
+      for (int i = 0; i < n; i++) {
+        if (is_multi[i]) {
+#ifdef CHENG_CHECK
+          cheng_assert(values[i].m_type == KindOfMulti);
+#endif
+          TypedValue *tmp = values[i].m_data.pmulti->getByVal(call_counter);
+          tvCopy(*tmp, values[i]);
+        }
+      }
+
+      TypedValue ret_arr;
+      ret_arr.m_type = KindOfArray;
+      ret_arr.m_data.parr = MixedArray::MakePacked(n, values);
+      // increase counter for all the elements
+      for (int s_idx = 0; s_idx < n; s_idx++) {
+        tvRefcountedIncRef(&values[s_idx]);
+      }
+
+      multi->addValueNoInc(ret_arr);
+    }
+
+    // change back to original stack, and decrease the refcount
+    memcpy(values, orig_stack, sizeof(struct TypedValue)*n);
+    for (int s_idx = 0; s_idx < n; s_idx++) {
+      tvRefcountedDecRef(&values[s_idx]);
+    }
+
+    vmStack().ndiscard(n);
+    vmStack().pushNull();
+    tvCopy(result, *(vmStack().topTV()));
+
+    END;
+  } else {
+    // This constructor moves values, no inc/decref is necessary.
+    auto* a = MixedArray::MakePacked(n, values);
+    vmStack().ndiscard(n);
+    vmStack().pushArrayNoRc(a);
+  }
 }
 
+// support 
 OPTBLD_INLINE void iopNewStructArray(IOP_ARGS) {
+  AS_ARR;
   pc++;
   auto n = decode<uint32_t>(pc); // number of keys and elements
-  assert(n > 0 && n <= StructArray::MaxMakeSize);
-  StringData* names[n];
-  for (size_t i = 0; i < n; i++) {
-    names[i] = decode_litstr(pc);
+
+  // cheng-hack:
+  bool multi_call = false;
+  std::vector<TypedValue*> stack_slot;
+  std::vector<MultiVal*> multi_elem;
+
+  for (int i = 0; i < n; i++) {
+    if (UNLIKELY(vmStack().indTV(i)->m_type == KindOfMulti)) {
+      multi_call = true;
+      stack_slot.push_back(vmStack().indTV(i));
+      multi_elem.push_back(vmStack().indTV(i)->m_data.pmulti);
+    }
   }
-  // This constructor moves values, no inc/decref is necessary.
-  ArrayData* a;
-  Shape* shape;
-  if (!RuntimeOption::EvalDisableStructArray &&
-      (shape = Shape::create(names, n))) {
-    a = MixedArray::MakeStructArray(n, vmStack().topC(), shape);
+
+  // if we have multi-val
+  if (UNLIKELY(multi_call)) {
+    START;
+    AS_MARR;
+    auto orig_pc = pc;
+    auto values = vmStack().topC();
+    ArrayData* a;
+
+    int multi_num = multi_elem[0]->valSize();
+    TypedValue multi_ret = MultiVal::makeMultiVal();
+    TypedValue orig_stack[n];
+    memcpy(orig_stack, values, sizeof(struct TypedValue)*n);
+
+#ifdef CHENG_CHECK
+    for (auto it : multi_elem) {
+      cheng_assert(it->valSize() == multi_num);
+    }
+    cheng_assert(multi_num > 1);
+#endif
+
+    for (int i = 0; i < multi_num; i++) {
+      pc = orig_pc;
+      // replace the stack elements
+      for (int j = 0; j < stack_slot.size(); j++) {
+        TypedValue* single = multi_elem[j]->getByVal(i);
+        tvCopy(*single, *stack_slot[j]);
+      }
+
+      assert(n > 0 && n <= StructArray::MaxMakeSize);
+      StringData* names[n];
+      for (size_t i = 0; i < n; i++) {
+        names[i] = decode_litstr(pc);
+      }
+      // USED TO BE: This constructor moves values, no inc/decref is necessary.
+      Shape* shape;
+      if (!RuntimeOption::EvalDisableStructArray &&
+          (shape = Shape::create(names, n))) {
+        a = MixedArray::MakeStructArray(n, vmStack().topC(), shape);
+      } else {
+        a = MixedArray::MakeStruct(n, names, vmStack().topC())->asArrayData();
+      }
+      // cheng-hack: inc the refcount
+      for (int s_idx = 0; s_idx < n; s_idx++) {
+        tvRefcountedIncRef(&values[s_idx]);
+      }
+
+      // cheng-hack:
+      TypedValue tmp;
+      tmp.m_type = KindOfArray;
+      tmp.m_data.parr = a;
+      multi_ret.m_data.pmulti->addValueNoInc(tmp);
+    }
+
+    // cheng-hack: replace the stack and dec the refcount
+    memcpy(values, orig_stack, sizeof(struct TypedValue)*n);
+    for (int s_idx = 0; s_idx < n; s_idx++) {
+      tvRefcountedDecRef(&values[s_idx]);
+    }
+    vmStack().ndiscard(n);
+    vmStack().pushMultiObject(multi_ret);
+    END;
   } else {
-    a = MixedArray::MakeStruct(n, names, vmStack().topC())->asArrayData();
+    // original case
+    assert(n > 0 && n <= StructArray::MaxMakeSize);
+    StringData* names[n];
+    for (size_t i = 0; i < n; i++) {
+      names[i] = decode_litstr(pc);
+    }
+    // USED TO BE: This constructor moves values, no inc/decref is necessary.
+    ArrayData* a;
+    Shape* shape;
+    if (!RuntimeOption::EvalDisableStructArray &&
+        (shape = Shape::create(names, n))) {
+      a = MixedArray::MakeStructArray(n, vmStack().topC(), shape);
+    } else {
+      a = MixedArray::MakeStruct(n, names, vmStack().topC())->asArrayData();
+    }
+    vmStack().ndiscard(n);
+    vmStack().pushArrayNoRc(a);
   }
-  vmStack().ndiscard(n);
-  vmStack().pushArrayNoRc(a);
 }
 
+// curtis:
 OPTBLD_INLINE void iopAddElemC(IOP_ARGS) {
+  AS_ARR;
   pc++;
   Cell* c1 = vmStack().topC();
   Cell* c2 = vmStack().indC(1);
   Cell* c3 = vmStack().indC(2);
-  if (c3->m_type != KindOfArray) {
-    raise_error("AddElemC: $3 must be an array");
-  }
-  if (c2->m_type == KindOfInt64) {
-    cellAsVariant(*c3).asArrRef().set(c2->m_data.num, tvAsCVarRef(c1));
+
+  if (UNLIKELY(c1->m_type == KindOfMulti) ||
+      UNLIKELY(c2->m_type == KindOfMulti) ||
+      UNLIKELY(c3->m_type == KindOfMulti)) {
+    START;
+    AS_MARR;
+    bool isFirstMulti = (c1->m_type == KindOfMulti);
+    bool isSecondMulti = (c2->m_type == KindOfMulti);
+    bool isThirdMulti = (c3->m_type == KindOfMulti);
+
+    if (isThirdMulti) {
+      // (M, *, *)
+      // No need to split the array
+      if (c3->m_data.pmulti->getType() != KindOfArray) {
+        raise_error("AddElemC: $3 must be an array");
+      }
+
+      if (isFirstMulti && isSecondMulti) {
+        // (M, M, M)
+        auto m1 = c1->m_data.pmulti;
+        auto m2 = c2->m_data.pmulti;
+        auto m3 = c3->m_data.pmulti;
+
+#ifdef CHENG_CHECK
+        cheng_assert((m1->valSize() == m2->valSize()) && (m1->valSize() == m3->valSize()));
+#endif
+
+        for (int i = 0; i < m1->valSize(); i++) {
+          TypedValue *cell1 = m1->getByVal(i);
+          TypedValue *cell2 = m2->getByVal(i);
+          TypedValue *cell3 = m3->getByVal(i);
+          if (cell2->m_type == KindOfInt64) {
+            tvAsVariant(cell3).asArrRef().set(cell2->m_data.num, tvAsCVarRef(cell1));
+          } else {
+            tvAsVariant(cell3).asArrRef().set(tvAsCVarRef(cell2), tvAsCVarRef(cell1));
+          }
+        }
+
+      } else if (isFirstMulti) {
+        // (M, S, M)
+        auto m1 = c1->m_data.pmulti;
+        auto m3 = c3->m_data.pmulti;
+
+#ifdef CHENG_CHECK
+        cheng_assert(m1->valSize() ==  m3->valSize());
+#endif
+
+        for (int i = 0; i < m1->valSize(); i++) {
+          TypedValue *cell1 = m1->getByVal(i);
+          TypedValue *cell3 = m3->getByVal(i);
+          if (c2->m_type == KindOfInt64) {
+            tvAsVariant(cell3).asArrRef().set(c2->m_data.num, tvAsCVarRef(cell1));
+          } else {
+            tvAsVariant(cell3).asArrRef().set(tvAsCVarRef(c2), tvAsCVarRef(cell1));
+          }
+        }
+      } else if (isSecondMulti) {
+        // (M, M, S)
+        auto m2 = c2->m_data.pmulti;
+        auto m3 = c3->m_data.pmulti;
+
+#ifdef CHENG_CHECK
+        cheng_assert(m2->valSize() ==  m3->valSize());
+#endif
+
+        for (int i = 0; i < m2->valSize(); i++) {
+          TypedValue *cell2 = m2->getByVal(i);
+          TypedValue *cell3 = m3->getByVal(i);
+          if (cell2->m_type == KindOfInt64) {
+            tvAsVariant(cell3).asArrRef().set(cell2->m_data.num, tvAsCVarRef(c1));
+          } else {
+            tvAsVariant(cell3).asArrRef().set(tvAsCVarRef(cell2), tvAsCVarRef(c1));
+          }
+        }
+      } else {
+        // (M, S, S)
+        auto m3 = c3->m_data.pmulti;
+        for (int i = 0; i < m3->valSize(); i++) {
+          TypedValue *cell3 = m3->getByVal(i);
+          if (c2->m_type == KindOfInt64) {
+            tvAsVariant(cell3).asArrRef().set(c2->m_data.num, tvAsCVarRef(c1));
+          } else {
+            tvAsVariant(cell3).asArrRef().set(tvAsCVarRef(c2), tvAsCVarRef(c1));
+          }
+        }
+      }
+    } else {
+      // (S, *, *)
+      // Need to split array
+      if (c3->m_type != KindOfArray) {
+        raise_error("AddElemC: $3 must be an array");
+      }
+      if (isFirstMulti && isSecondMulti) {
+        // (S, M, M)
+        auto m1 = c1->m_data.pmulti;
+        auto m2 = c2->m_data.pmulti;
+
+#ifdef CHENG_CHECK
+        cheng_assert(m1->valSize() == m2->valSize());
+#endif
+
+        TypedValue ret = MultiVal::splitArray(*c3, m1->valSize());
+        auto ret_multi = ret.m_data.pmulti; 
+
+        for (int i = 0; i < m1->valSize(); i++) {
+          TypedValue *cell1 = m1->getByVal(i);
+          TypedValue *cell2 = m2->getByVal(i);
+          TypedValue *cell3 = ret_multi->getByVal(i);
+          if (cell2->m_type == KindOfInt64) {
+            tvAsVariant(cell3).asArrRef().set(cell2->m_data.num, tvAsCVarRef(cell1));
+          } else {
+            tvAsVariant(cell3).asArrRef().set(tvAsCVarRef(cell2), tvAsCVarRef(cell1));
+          }
+        }
+        tvCopy(ret, *c3);
+      } else if (isFirstMulti) {
+        // (S, S, M)
+        auto multi = c1->m_data.pmulti;
+
+        TypedValue ret = MultiVal::splitArray(*c3, multi->valSize());
+        auto ret_multi = ret.m_data.pmulti; 
+
+        for (int i = 0; i < multi->valSize(); i++) {
+          TypedValue *cell1 = multi->getByVal(i);
+          TypedValue *cell3 = ret_multi->getByVal(i);
+          if (c2->m_type == KindOfInt64) {
+            tvAsVariant(cell3).asArrRef().set(c2->m_data.num, tvAsCVarRef(cell1));
+          } else {
+            tvAsVariant(cell3).asArrRef().set(tvAsCVarRef(c2), tvAsCVarRef(cell1));
+          }
+        }
+        tvCopy(ret, *c3);
+      } else {
+        // (S, M, S)
+        auto multi = c2->m_data.pmulti;
+
+        TypedValue ret = MultiVal::splitArray(*c3, multi->valSize());
+        auto ret_multi = ret.m_data.pmulti; 
+
+        for (int i = 0; i < multi->valSize(); i++) {
+          TypedValue *cell2 = multi->getByVal(i);
+          TypedValue *cell3 = ret_multi->getByVal(i);
+          if (cell2->m_type == KindOfInt64) {
+            tvAsVariant(cell3).asArrRef().set(cell2->m_data.num, tvAsCVarRef(c1));
+          } else {
+            tvAsVariant(cell3).asArrRef().set(tvAsCVarRef(cell2), tvAsCVarRef(c1));
+          }
+        }
+        tvCopy(ret, *c3);
+      }
+    }
+    END;
   } else {
-    cellAsVariant(*c3).asArrRef().set(tvAsCVarRef(c2), tvAsCVarRef(c1));
+    // No multi-values
+    if (c3->m_type != KindOfArray) {
+      raise_error("AddElemC: $3 must be an array");
+    }
+
+    if (c2->m_type == KindOfInt64) {
+      cellAsVariant(*c3).asArrRef().set(c2->m_data.num, tvAsCVarRef(c1));
+    } else {
+      cellAsVariant(*c3).asArrRef().set(tvAsCVarRef(c2), tvAsCVarRef(c1));
+    }
   }
   vmStack().popC();
   vmStack().popC();
 }
 
+// Not Impl
 OPTBLD_INLINE void iopAddElemV(IOP_ARGS) {
+  AS_ARR;
   pc++;
   Ref* r1 = vmStack().topV();
   Cell* c2 = vmStack().indC(1);
   Cell* c3 = vmStack().indC(2);
+#ifdef CHENG_CHECK
+  cheng_assert(r1->m_type != KindOfMulti);
+  cheng_assert(c2->m_type != KindOfMulti);
+  cheng_assert(c3->m_type != KindOfMulti);
+#endif
   if (c3->m_type != KindOfArray) {
     raise_error("AddElemV: $3 must be an array");
   }
@@ -3651,29 +6195,168 @@ OPTBLD_INLINE void iopAddElemV(IOP_ARGS) {
   vmStack().popC();
 }
 
+// curtis:
 OPTBLD_INLINE void iopAddNewElemC(IOP_ARGS) {
+  AS_ARR;
   pc++;
   Cell* c1 = vmStack().topC();
   Cell* c2 = vmStack().indC(1);
-  if (c2->m_type != KindOfArray) {
-    raise_error("AddNewElemC: $2 must be an array");
+  if(UNLIKELY(c1->m_type == KindOfMulti || c2->m_type == KindOfMulti)) {
+    START;
+    AS_MARR;
+    bool isFirstMulti = (c1->m_type == KindOfMulti); 
+    bool isSecondMulti = (c2->m_type == KindOfMulti);
+
+    if (isFirstMulti && isSecondMulti) {
+      // (M, M)
+      // No need to split the array
+      auto m1 = c1->m_data.pmulti;
+      auto m2 = c2->m_data.pmulti;
+
+      if (m2->getType() != KindOfArray) {
+        raise_error("AddNewElemC: $2 must be an array");
+      }
+
+#ifdef CHENG_CHECK
+      cheng_assert(m1->valSize() == m2->valSize());
+#endif
+
+      for (int i = 0; i < m1->valSize(); i++) {
+        TypedValue *v1 = m1->getByVal(i);
+        TypedValue *v2 = m2->getByVal(i);
+        tvAsVariant(v2).asArrRef().append(tvAsCVarRef(v1));
+      }
+
+      vmStack().popC();
+
+    } else if (isFirstMulti) {
+      // (M, S)
+      // Split the array
+      auto multi = c1->m_data.pmulti;
+
+      if (c2->m_type != KindOfArray) {
+        raise_error("AddNewElemC: $2 must be an array");
+      }
+
+      TypedValue ret = MultiVal::splitArray(*c2, multi->valSize());
+      auto ret_multi = ret.m_data.pmulti;
+
+      for (int i = 0; i < multi->valSize(); i++) {
+        TypedValue *v1 = multi->getByVal(i);
+        TypedValue *v2 = ret_multi->getByVal(i);
+        tvAsVariant(v2).asArrRef().append(tvAsCVarRef(v1));
+      }
+
+      tvCopy(ret, *c2);
+      vmStack().popC();
+
+    } else {
+      // (S, M)
+      // No need to split the array
+      auto multi = c2->m_data.pmulti;
+
+      if (multi->getType() != KindOfArray) {
+        raise_error("AddNewElemC: $2 must be an array");
+      }
+
+      for (int i = 0; i < multi->valSize(); i++) {
+        TypedValue *v = multi->getByVal(i);
+        tvAsVariant(v).asArrRef().append(tvAsCVarRef(c1));
+      }
+
+      vmStack().popC();
+    }
+
+    END;
+  } else {
+    // (S, S)
+    if (c2->m_type != KindOfArray) {
+      raise_error("AddNewElemC: $2 must be an array");
+    }
+    cellAsVariant(*c2).asArrRef().append(tvAsCVarRef(c1));
+    vmStack().popC();
   }
-  cellAsVariant(*c2).asArrRef().append(tvAsCVarRef(c1));
-  vmStack().popC();
 }
 
+// cheng-hack: supported 
 OPTBLD_INLINE void iopAddNewElemV(IOP_ARGS) {
+  AS_ARR;
   pc++;
   Ref* r1 = vmStack().topV();
   Cell* c2 = vmStack().indC(1);
+
+  // cheng-hack: for case "array($multi, &$result)"
+  if (UNLIKELY(r1->m_type == KindOfMulti || c2->m_type == KindOfMulti)) {
+    START;
+    AS_MARR;
+    bool ref_multi = (r1->m_type == KindOfMulti); 
+    bool arr_multi = (c2->m_type == KindOfMulti);
+    // check KindOfArray
+    if (arr_multi) {
+      cheng_assert(c2->m_data.pmulti->getType() == KindOfArray);
+    } else {
+      cheng_assert(c2->m_type == KindOfArray);
+    }
+    // check KindOfRef
+    if (ref_multi) {
+      cheng_assert(r1->m_data.pmulti->getType() == KindOfRef);
+    } else {
+      cheng_assert(r1->m_type == KindOfRef);
+    }
+
+    if (ref_multi && arr_multi) {
+      cheng_assert(r1->m_data.pmulti->valSize() == c2->m_data.pmulti->valSize());
+      int size = c2->m_data.pmulti->valSize();
+      for (int i = 0; i < size; i++) {
+        auto arr = c2->m_data.pmulti->getByVal(i);
+        auto ref = r1->m_data.pmulti->getByVal(i);
+        cellAsVariant(*arr).asArrRef().appendRef(tvAsVariant(ref));
+      }
+    } else if (arr_multi) {
+      // split the ref
+      int size = c2->m_data.pmulti->valSize();
+
+      TypedValue *cell = r1->m_data.pref->tv();
+      // if the ref is point to single element, split it!
+      // And this will generate ref->multi 
+      if (cell->m_type != KindOfMulti) {
+        TypedValue tmp = splitElements(cell, size);
+        // make the multi-val to ref
+        tvBoxMulti(&tmp);
+        tvCopy(tmp, *cell);
+      }
+
+      for (int i = 0; i < size; i++) {
+        auto arr = c2->m_data.pmulti->getByVal(i);
+        auto ref = cell->m_data.pmulti->getByVal(i);
+        cellAsVariant(*arr).asArrRef().appendRef(tvAsVariant(ref));
+      }
+    } else { // ref_multi
+      int size = r1->m_data.pmulti->valSize();
+      TypedValue ret = MultiVal::splitArray(*c2, size);
+      auto ret_multi = ret.m_data.pmulti;
+
+      for (int i = 0; i < size; i++) {
+        auto ref = r1->m_data.pmulti->getByVal(i);
+        auto arr = ret_multi->getByVal(i);
+        cellAsVariant(*arr).asArrRef().appendRef(tvAsVariant(ref));
+      }
+      tvCopy(ret, *c2);
+    }
+    vmStack().popV();
+    END;
+  } else {
   if (c2->m_type != KindOfArray) {
     raise_error("AddNewElemV: $2 must be an array");
   }
   cellAsVariant(*c2).asArrRef().appendRef(tvAsVariant(r1));
   vmStack().popV();
+  }
 }
 
+// Good to go
 OPTBLD_INLINE void iopNewCol(IOP_ARGS) {
+  AS_ARR;
   pc++;
   auto cType = decode_iva(pc);
   auto nElms = decode_iva(pc);
@@ -3681,10 +6364,16 @@ OPTBLD_INLINE void iopNewCol(IOP_ARGS) {
   vmStack().pushObject(obj);
 }
 
+// Not Impl
 OPTBLD_INLINE void iopColAddNewElemC(IOP_ARGS) {
+  AS_ARR;
   pc++;
   Cell* c1 = vmStack().topC();
   Cell* c2 = vmStack().indC(1);
+#ifdef CHENG_CHECK
+  cheng_assert(c1->m_type != KindOfMulti);
+  cheng_assert(c2->m_type != KindOfMulti);
+#endif
   if (c2->m_type == KindOfObject && c2->m_data.pobj->isCollection()) {
     collectionInitAppend(c2->m_data.pobj, c1);
   } else {
@@ -3693,11 +6382,18 @@ OPTBLD_INLINE void iopColAddNewElemC(IOP_ARGS) {
   vmStack().popC();
 }
 
+// Not Impl
 OPTBLD_INLINE void iopColAddElemC(IOP_ARGS) {
+  AS_ARR;
   pc++;
   Cell* c1 = vmStack().topC();
   Cell* c2 = vmStack().indC(1);
   Cell* c3 = vmStack().indC(2);
+#ifdef CHENG_CHECK
+  cheng_assert(c1->m_type != KindOfMulti);
+  cheng_assert(c2->m_type != KindOfMulti);
+  cheng_assert(c3->m_type != KindOfMulti);
+#endif
   if (c3->m_type == KindOfObject && c3->m_data.pobj->isCollection()) {
     collectionInitSet(c3->m_data.pobj, c2, c1);
   } else {
@@ -3707,6 +6403,7 @@ OPTBLD_INLINE void iopColAddElemC(IOP_ARGS) {
   vmStack().popC();
 }
 
+// Good to go
 OPTBLD_INLINE void iopCns(IOP_ARGS) {
   pc++;
   auto s = decode_litstr(pc);
@@ -3720,6 +6417,7 @@ OPTBLD_INLINE void iopCns(IOP_ARGS) {
   cellDup(*cns, *c1);
 }
 
+// Good to go
 OPTBLD_INLINE void iopCnsE(IOP_ARGS) {
   pc++;
   auto s = decode_litstr(pc);
@@ -3731,6 +6429,7 @@ OPTBLD_INLINE void iopCnsE(IOP_ARGS) {
   cellDup(*cns, *c1);
 }
 
+// Good to go
 OPTBLD_INLINE void iopCnsU(IOP_ARGS) {
   pc++;
   auto name = decode_litstr(pc);
@@ -3752,6 +6451,8 @@ OPTBLD_INLINE void iopCnsU(IOP_ARGS) {
   cellDup(*cns, *c1);
 }
 
+// Good to go
+// The value on stack can be MultiVal
 OPTBLD_INLINE void iopDefCns(IOP_ARGS) {
   pc++;
   auto s = decode_litstr(pc);
@@ -3759,9 +6460,14 @@ OPTBLD_INLINE void iopDefCns(IOP_ARGS) {
   vmStack().replaceTV<KindOfBoolean>(result);
 }
 
+// Good to go
 OPTBLD_INLINE void iopClsCns(IOP_ARGS) {
   pc++;
   auto clsCnsName = decode_litstr(pc);
+
+#ifdef CHENG_CHECK
+  cheng_assert(vmStack().topTV()->m_type != KindOfMulti);
+#endif
 
   auto const cls    = vmStack().topA();
   auto const clsCns = cls->clsCnsGet(clsCnsName);
@@ -3774,6 +6480,7 @@ OPTBLD_INLINE void iopClsCns(IOP_ARGS) {
   cellDup(clsCns, *vmStack().topTV());
 }
 
+// Good to go
 OPTBLD_INLINE void iopClsCnsD(IOP_ARGS) {
   pc++;
   auto clsCnsName = decode_litstr(pc);
@@ -3787,23 +6494,98 @@ OPTBLD_INLINE void iopClsCnsD(IOP_ARGS) {
   cellDup(clsCns, *c1);
 }
 
+// Supported 
 OPTBLD_INLINE void iopConcat(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   Cell* c1 = vmStack().topC();
   Cell* c2 = vmStack().indC(1);
 
-  cellAsVariant(*c2) = concat(cellAsVariant(*c2).toString(),
-                              cellAsCVarRef(*c1).toString());
-  assert(check_refcount_nz(c2->m_data.pstr->getCount()));
-  vmStack().popC();
+  if (UNLIKELY(c1->m_type == KindOfMulti ||
+               c2->m_type == KindOfMulti)) {
+    START;
+    AS_MARITH;
+    bool isFirstMulti = (c1->m_type == KindOfMulti);  
+    bool isSecondMulti = (c2->m_type == KindOfMulti);  
+    int multi_size = isFirstMulti ? c1->m_data.pmulti->valSize() : c2->m_data.pmulti->valSize();
+
+#ifdef CHENG_CHECK
+    if (isFirstMulti && isSecondMulti) {
+      cheng_assert(c1->m_data.pmulti->valSize() == c2->m_data.pmulti->valSize());
+    }
+#endif
+
+    if (isFirstMulti && isSecondMulti) {
+      // c1 and c2 are both multi-val
+      //TypedValue ret = MultiVal::cloneMultiVal(*c2);
+      TypedValue ret = in_makeMultiVal(multi_size, KindOfString);
+      auto ret_multi = ret.m_data.pmulti;
+      auto multi_1 = c1->m_data.pmulti;
+      auto multi_2 = c2->m_data.pmulti;
+      for(int i = 0; i < multi_size; i++) {
+        TypedValue *m1 = multi_1->getByVal(i);
+        TypedValue *m2 = multi_2->getByVal(i);
+        TypedValue *loc = ret_multi->getByVal(i);
+        cellAsVariant(*loc) = concat(cellAsVariant(*m2).toString(), cellAsCVarRef(*m1).toString());
+      }
+      vmStack().popC();
+      tvRefcountedDecRef(c2);
+      tvCopy(ret, *c2);
+
+    } else if (isFirstMulti) {
+      // c1 is multi-val, c2 is non multi-val
+      //TypedValue ret = MultiVal::cloneMultiVal(*c1);
+      TypedValue ret = in_makeMultiVal(multi_size, KindOfString); 
+      auto ret_multi = ret.m_data.pmulti;
+      auto multi = c1->m_data.pmulti;
+      for (int i = 0; i < multi_size; i++) {
+        TypedValue *c = multi->getByVal(i);
+        TypedValue *loc = ret_multi->getByVal(i);
+        cellAsVariant(*loc) = concat(cellAsVariant(*c2).toString(), cellAsCVarRef(*c).toString());
+      }
+      vmStack().popC();
+      tvRefcountedDecRef(c2);
+      tvCopy(ret, *c2);
+
+    } else {
+      // c1 is not multi-val, c2 is multi-val
+      //TypedValue ret = MultiVal::cloneMultiVal(*c2);
+      TypedValue ret = in_makeMultiVal(multi_size, KindOfString); 
+      auto ret_multi = ret.m_data.pmulti;
+      auto multi = c2->m_data.pmulti;
+      for (int i = 0; i < multi_size; i++) {
+        TypedValue *c = multi->getByVal(i);
+        TypedValue *loc = ret_multi->getByVal(i);
+        cellAsVariant(*loc) = concat(cellAsVariant(*c).toString(), cellAsCVarRef(*c1).toString());
+      }
+      vmStack().popC();
+      tvRefcountedDecRef(c2);
+      tvCopy(ret, *c2);
+    }
+
+    END;
+  } else {
+    // c1 and c2 are both not multi-val
+    cellAsVariant(*c2) = concat(cellAsVariant(*c2).toString(),
+                                cellAsCVarRef(*c1).toString());
+    assert(check_refcount_nz(c2->m_data.pstr->getCount()));
+    vmStack().popC();
+  }
 }
 
+// Not Impl
 OPTBLD_INLINE void iopConcatN(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   auto n = decode_iva(pc);
 
   Cell* c1 = vmStack().topC();
   Cell* c2 = vmStack().indC(1);
+
+#ifdef CHENG_CHECK
+  cheng_assert(c1->m_type != KindOfMulti);
+  cheng_assert(c2->m_type != KindOfMulti);
+#endif
 
   if (n == 2) {
     cellAsVariant(*c2) = concat(cellAsVariant(*c2).toString(),
@@ -3811,6 +6593,9 @@ OPTBLD_INLINE void iopConcatN(IOP_ARGS) {
     assert(check_refcount_nz(c2->m_data.pstr->getCount()));
   } else if (n == 3) {
     Cell* c3 = vmStack().indC(2);
+#ifdef CHENG_CHECK
+  cheng_assert(c3->m_type != KindOfMulti);
+#endif
     cellAsVariant(*c3) = concat3(cellAsVariant(*c3).toString(),
                                  cellAsCVarRef(*c2).toString(),
                                  cellAsCVarRef(*c1).toString());
@@ -3818,6 +6603,10 @@ OPTBLD_INLINE void iopConcatN(IOP_ARGS) {
   } else /* n == 4 */ {
     Cell* c3 = vmStack().indC(2);
     Cell* c4 = vmStack().indC(3);
+#ifdef CHENG_CHECK
+  cheng_assert(c3->m_type != KindOfMulti);
+  cheng_assert(c4->m_type != KindOfMulti);
+#endif
     cellAsVariant(*c4) = concat4(cellAsVariant(*c4).toString(),
                                  cellAsCVarRef(*c3).toString(),
                                  cellAsCVarRef(*c2).toString(),
@@ -3830,177 +6619,438 @@ OPTBLD_INLINE void iopConcatN(IOP_ARGS) {
   }
 }
 
+// cheng-hack:
 OPTBLD_INLINE void iopNot(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   Cell* c1 = vmStack().topC();
-  cellAsVariant(*c1) = !cellAsVariant(*c1).toBoolean();
+  // cheng-hack:
+  // for each value inside multi-value variable, calculate and collect the result
+  if (UNLIKELY(c1->m_type == KindOfMulti)) {
+    START;
+    AS_MARITH;
+    auto multi = c1->m_data.pmulti;
+    TypedValue ret = MultiVal::makeMultiVal();
+    auto ret_multi = ret.m_data.pmulti;
+    // go through all the values 
+    for (int i = 0; i < multi->valSize(); i++) {
+      TypedValue *c = multi->getByVal(i);
+      TypedValue *tmp_result = Variant(!cellAsVariant(*c).toBoolean()).asTypedValue();
+      ret_multi->addValue(*tmp_result);
+    }
+    tvCopy(ret, *c1);
+    END;
+  } else {
+    cellAsVariant(*c1) = !cellAsVariant(*c1).toBoolean();
+  }
 }
 
+// cheng-hack:
 template<class Op>
 OPTBLD_INLINE void implCellBinOp(PC& pc, Op op) {
   pc++;
   auto const c1 = vmStack().topC();
   auto const c2 = vmStack().indC(1);
-  auto const result = op(*c2, *c1);
-  tvRefcountedDecRef(c2);
-  *c2 = result;
-  vmStack().popC();
+  if (UNLIKELY(c1->m_type == KindOfMulti ||
+               c2->m_type == KindOfMulti)) {
+    START;
+    AS_MARITH;
+    bool isFirstMulti = (c1->m_type == KindOfMulti);  
+    bool isSecondMulti = (c2->m_type == KindOfMulti);  
+    MultiVal* m1 = isFirstMulti ? c1->m_data.pmulti : nullptr;
+    MultiVal* m2 = isSecondMulti ? c2->m_data.pmulti : nullptr;
+
+
+#ifdef CHENG_CHECK
+    if (isFirstMulti && isSecondMulti) {
+      cheng_assert( m1->valSize() == m2->valSize() );
+    }
+#endif
+
+    TypedValue ret_multi = MultiVal::makeMultiVal();
+    if (isFirstMulti && isSecondMulti) {
+      // (M, M) case
+      for (int i = 0; i < m1->valSize(); i++) {
+        auto const result = op(*m2->getByVal(i), *m1->getByVal(i));
+        ret_multi.m_data.pmulti->addValue(result);
+      }
+    } else {
+      // (S, M) and (M, S) case
+      auto const multi = isFirstMulti ? m1 : m2;
+      auto const other = isFirstMulti ? c2 : c1;
+#ifdef CHENG_CHECK
+      cheng_assert( multi != nullptr); 
+#endif
+      for (int i = 0; i < multi->valSize(); i++) {
+        // should be : op c2, c1
+        if (c2 == other) {
+          auto const result = op(*other, *multi->getByVal(i));
+          ret_multi.m_data.pmulti->addValue(result);
+        } else {
+          auto const result = op(*multi->getByVal(i), *other);
+          ret_multi.m_data.pmulti->addValue(result);
+        }
+      }
+    }
+
+    tvRefcountedDecRef(c2);
+    tvCopy(ret_multi, *c2);
+    vmStack().popC();
+    END;
+  } else {
+    // normal case
+    auto const result = op(*c2, *c1);
+    tvRefcountedDecRef(c2);
+    *c2 = result;
+    vmStack().popC();
+  }
 }
 
+// cheng-hack:
 template<class Op>
 OPTBLD_INLINE void implCellBinOpBool(PC& pc, Op op) {
   pc++;
   auto const c1 = vmStack().topC();
   auto const c2 = vmStack().indC(1);
-  bool const result = op(*c2, *c1);
-  tvRefcountedDecRef(c2);
-  *c2 = make_tv<KindOfBoolean>(result);
-  vmStack().popC();
+
+  // cheng-hack:
+  if (UNLIKELY(c1->m_type == KindOfMulti ||
+               c2->m_type == KindOfMulti) ) {
+    START;
+    AS_MARITH;
+
+    bool isFirstMulti  = (c1->m_type == KindOfMulti);
+    bool isSecondMulti = (c2->m_type == KindOfMulti);
+    int reqNum = (isFirstMulti) ? c1->m_data.pmulti->valSize() :
+                               c2->m_data.pmulti->valSize();
+    TypedValue ret = in_makeMultiVal(reqNum, KindOfBoolean);
+
+    if (isFirstMulti && isSecondMulti) {
+#ifdef CHENG_CHECK
+      cheng_assert(c1->m_data.pmulti->valSize()
+                    == c2->m_data.pmulti->valSize());
+#endif
+      for (int i = 0; i < reqNum; i++) {
+        auto const tmpc1 = c1->m_data.pmulti->getByVal(i);
+        auto const tmpc2 = c2->m_data.pmulti->getByVal(i);
+        auto result = op(*tmpc2, *tmpc1);
+        tvAsVariant(ret.m_data.pmulti->getByVal(i)) = result;
+      }
+    } else {
+      // only one multiVal
+      auto const multi = isFirstMulti ? c1 : c2;
+      auto const other = isFirstMulti ? c2 : c1;
+      for (int i = 0; i < reqNum; i++) {
+        auto it = multi->m_data.pmulti->getByVal(i);
+        // should be: op c2, c1
+        if (c2 == other) {
+          auto result = op(*other, *it);
+          tvAsVariant(ret.m_data.pmulti->getByVal(i)) = result;
+        } else {
+          auto result = op(*it, *other);
+          tvAsVariant(ret.m_data.pmulti->getByVal(i)) = result;
+        }
+      }
+    }
+    tvRefcountedDecRef(c2);
+    tvCopy(ret, *c2);
+    vmStack().popC();
+    END;
+  } else {
+    bool const result = op(*c2, *c1);
+    tvRefcountedDecRef(c2);
+    *c2 = make_tv<KindOfBoolean>(result);
+    vmStack().popC();
+  }
+
 }
 
 OPTBLD_INLINE void iopAdd(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellAdd);
 }
 
 OPTBLD_INLINE void iopSub(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellSub);
 }
 
 OPTBLD_INLINE void iopMul(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellMul);
 }
 
 OPTBLD_INLINE void iopAddO(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellAddO);
 }
 
 OPTBLD_INLINE void iopSubO(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellSubO);
 }
 
 OPTBLD_INLINE void iopMulO(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellMulO);
 }
 
 OPTBLD_INLINE void iopDiv(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellDiv);
 }
 
 OPTBLD_INLINE void iopPow(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellPow);
 }
 
 OPTBLD_INLINE void iopMod(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellMod);
 }
 
 OPTBLD_INLINE void iopBitAnd(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellBitAnd);
 }
 
 OPTBLD_INLINE void iopBitOr(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellBitOr);
 }
 
 OPTBLD_INLINE void iopBitXor(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellBitXor);
 }
 
 OPTBLD_INLINE void iopXor(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOpBool(pc, [&] (Cell c1, Cell c2) -> bool {
     return cellToBool(c1) ^ cellToBool(c2);
   });
 }
 
 OPTBLD_INLINE void iopSame(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOpBool(pc, cellSame);
 }
 
 OPTBLD_INLINE void iopNSame(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOpBool(pc, [&] (Cell c1, Cell c2) {
     return !cellSame(c1, c2);
   });
 }
 
 OPTBLD_INLINE void iopEq(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOpBool(pc, [&] (Cell c1, Cell c2) {
     return cellEqual(c1, c2);
   });
 }
 
 OPTBLD_INLINE void iopNeq(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOpBool(pc, [&] (Cell c1, Cell c2) {
     return !cellEqual(c1, c2);
   });
 }
 
 OPTBLD_INLINE void iopLt(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOpBool(pc, [&] (Cell c1, Cell c2) {
     return cellLess(c1, c2);
   });
 }
 
 OPTBLD_INLINE void iopLte(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOpBool(pc, cellLessOrEqual);
 }
 
 OPTBLD_INLINE void iopGt(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOpBool(pc, [&] (Cell c1, Cell c2) {
     return cellGreater(c1, c2);
   });
 }
 
 OPTBLD_INLINE void iopGte(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOpBool(pc, cellGreaterOrEqual);
 }
 
 OPTBLD_INLINE void iopShl(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellShl);
 }
 
 OPTBLD_INLINE void iopShr(IOP_ARGS) {
+  AS_ARITH;
   implCellBinOp(pc, cellShr);
 }
 
+// curtis:
 OPTBLD_INLINE void iopBitNot(IOP_ARGS) {
+  AS_ARITH;
   pc++;
-  cellBitNot(*vmStack().topC());
+  Cell *c1 = vmStack().topC();
+  if (UNLIKELY(c1->m_type == KindOfMulti)) {
+    START;
+    AS_MARITH;
+    // multi-val
+    //TypedValue ret = MultiVal::cloneMultiVal(c1);
+    auto ret_multi = c1->m_data.pmulti;
+    for (int i = 0; i < ret_multi->valSize(); i++) {
+      TypedValue *c = ret_multi->getByVal(i);
+      cellBitNot(*c);
+    }
+    END;
+  } else {
+    // non multi-val
+    cellBitNot(*c1);
+  }
 }
 
+// curtis:
 OPTBLD_INLINE void iopCastBool(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   Cell* c1 = vmStack().topC();
-  tvCastToBooleanInPlace(c1);
+  if (UNLIKELY(c1->m_type == KindOfMulti)) {
+    START;
+    AS_MARITH;
+    // multi-val
+    //TypedValue ret = MultiVal::cloneMultiVal(c1);
+    auto ret_multi = c1->m_data.pmulti;
+    for (int i = 0; i < ret_multi->valSize(); i++) {
+      TypedValue *c = ret_multi->getByVal(i);
+      tvCastToBooleanInPlace(c);
+    }
+    ret_multi->setType(KindOfBoolean);
+    END;
+  } else {
+    // non multi-val
+    tvCastToBooleanInPlace(c1);
+  }
 }
 
+// curtis:
 OPTBLD_INLINE void iopCastInt(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   Cell* c1 = vmStack().topC();
-  tvCastToInt64InPlace(c1);
+  if (UNLIKELY(c1->m_type == KindOfMulti)) {
+    START;
+    AS_MARITH;
+    // multi-val
+    //TypedValue ret = MultiVal::cloneMultiVal(c1);
+    auto ret_multi = c1->m_data.pmulti;
+    for (int i = 0; i < ret_multi->valSize(); i++) {
+      TypedValue *c = ret_multi->getByVal(i);
+      tvCastToInt64InPlace(c);
+    }
+    ret_multi->setType(KindOfInt64);
+    END;
+  } else { 
+    // non multi-val
+    tvCastToInt64InPlace(c1);
+  }
 }
 
+// curtis:
 OPTBLD_INLINE void iopCastDouble(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   Cell* c1 = vmStack().topC();
-  tvCastToDoubleInPlace(c1);
+  if (UNLIKELY(c1->m_type == KindOfMulti)) {
+    START;
+    AS_MARITH;
+    // multi-val
+    //TypedValue ret = MultiVal::cloneMultiVal(c1);
+    auto ret_multi = c1->m_data.pmulti;
+    for (int i = 0; i < ret_multi->valSize(); i++) {
+      TypedValue *c = ret_multi->getByVal(i);
+      tvCastToDoubleInPlace(c);
+    }
+    ret_multi->setType(KindOfDouble);
+    END;
+  } else { 
+    // non multi-val
+    tvCastToDoubleInPlace(c1);
+  }
 }
 
+// curtis:
 OPTBLD_INLINE void iopCastString(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   Cell* c1 = vmStack().topC();
-  tvCastToStringInPlace(c1);
+  if (UNLIKELY(c1->m_type == KindOfMulti)) {
+    START;
+    AS_MARITH;
+    // multi-val
+    //TypedValue ret = MultiVal::cloneMultiVal(c1);
+    auto ret_multi = c1->m_data.pmulti;
+    auto type = KindOfString;
+    for (int i = 0; i < ret_multi->valSize(); i++) {
+      TypedValue *c = ret_multi->getByVal(i);
+      tvCastToStringInPlace(c);
+      type = c->m_type;
+    }
+    ret_multi->setType(type); // can be String or staticString
+    END;
+  } else { 
+    // non multi-val
+    tvCastToStringInPlace(c1);
+  }
 }
 
+// curtis:
 OPTBLD_INLINE void iopCastArray(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   Cell* c1 = vmStack().topC();
-  tvCastToArrayInPlace(c1);
+  if (UNLIKELY(c1->m_type == KindOfMulti)) {
+    START;
+    AS_MARITH;
+    // multi-val
+    auto multi = c1->m_data.pmulti;
+    for (int i = 0; i < multi->valSize(); i++) {
+      TypedValue *c = multi->getByVal(i);
+      tvCastToArrayInPlace(c);
+    }
+    multi->setType(KindOfArray);
+    END;
+  } else { 
+    // non multi-val
+    tvCastToArrayInPlace(c1);
+  }
 }
 
+// curtis:
 OPTBLD_INLINE void iopCastObject(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   Cell* c1 = vmStack().topC();
-  tvCastToObjectInPlace(c1);
+  if (UNLIKELY(c1->m_type == KindOfMulti)) {
+    START;
+    AS_MARITH;
+    // multi-val
+    //TypedValue ret = MultiVal::cloneMultiVal(c1);
+    auto ret_multi = c1->m_data.pmulti;
+    for (int i = 0; i < ret_multi->valSize(); i++) {
+      TypedValue *c = ret_multi->getByVal(i);
+      tvCastToObjectInPlace(c);
+    }
+    ret_multi->setType(KindOfObject);
+    END;
+  } else { 
+    // non multi-val
+    tvCastToObjectInPlace(c1);
+  }
 }
 
 OPTBLD_INLINE bool cellInstanceOf(TypedValue* tv, const NamedEntity* ne) {
@@ -4035,6 +7085,7 @@ OPTBLD_INLINE bool cellInstanceOf(TypedValue* tv, const NamedEntity* ne) {
       return cls && tv->m_data.pobj->instanceof(cls);
 
     case KindOfRef:
+    case KindOfMulti: // should split the multi before this stage
     case KindOfClass:
       break;
   }
@@ -4052,10 +7103,45 @@ bool implInstanceOfHelper(const StringData* str1, Cell* c2) {
   return false;
 }
 
+// cheng-hack: this is a function to check whether all the objs in one
+// multi-value belong to one class
+static ALWAYS_INLINE void
+check_objs_with_same_class(Cell* cell) {
+  cheng_assert(cell->m_type == KindOfMulti);
+
+  Class* cls = nullptr;
+  for (auto it : *cell->m_data.pmulti) {
+    if (cls == nullptr) {
+      cls = it->m_data.pobj->getVMClass();
+    } else {
+      cheng_assert(cls == it->m_data.pobj->getVMClass());
+    }
+  }
+}
+
+// cheng-hack:
 OPTBLD_INLINE void iopInstanceOf(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   Cell* c1 = vmStack().topC();   // c2 instanceof c1
   Cell* c2 = vmStack().indC(1);
+
+  // cheng-hack: c1 cannot be multiVal
+  cheng_assert(c1->m_type != KindOfMulti);
+  // this is a trick:
+  if (c2->m_type == KindOfMulti) {
+    START;
+    AS_MARITH;
+#ifdef CHENG_CHECK
+    // check if all the elements belong to the same class
+    if (c2->m_data.pmulti->getType() == KindOfObject) {
+      check_objs_with_same_class(c2);
+    }
+#endif
+    c2 = c2->m_data.pmulti->getByVal(0); // this is readonly, so we are fine
+    END;
+  }
+
   bool r = false;
   if (IS_STRING_TYPE(c1->m_type)) {
     r = implInstanceOfHelper(c1->m_data.pstr, c2);
@@ -4072,7 +7158,9 @@ OPTBLD_INLINE void iopInstanceOf(IOP_ARGS) {
   vmStack().replaceC<KindOfBoolean>(r);
 }
 
+// cheng-hack:
 OPTBLD_INLINE void iopInstanceOfD(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   auto id = decode<Id>(pc);
   if (isProfileRequest()) {
@@ -4080,32 +7168,93 @@ OPTBLD_INLINE void iopInstanceOfD(IOP_ARGS) {
   }
   const NamedEntity* ne = vmfp()->m_func->unit()->lookupNamedEntityId(id);
   Cell* c1 = vmStack().topC();
+  // cheng-hack:
+  if (c1->m_type == KindOfMulti) {
+    START;
+    AS_MARITH;
+#ifdef CHENG_CHECK
+    // check if all the elements belong to the same class
+    if (c1->m_data.pmulti->getType() == KindOfObject) {
+      check_objs_with_same_class(c1);
+    }
+#endif
+    c1 = c1->m_data.pmulti->getByVal(0); // this is reaqonly, so we are fine
+   END;
+  }
   bool r = cellInstanceOf(c1, ne);
   vmStack().replaceC<KindOfBoolean>(r);
 }
 
 OPTBLD_INLINE void iopPrint(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   Cell* c1 = vmStack().topC();
-  g_context->write(cellAsVariant(*c1).toString());
+#ifdef CHENG_PRINT_N
+  if (c1->m_type == KindOfMulti) {
+    c1 = c1->m_data.pmulti->getByVal(CHENG_PRINT_N);
+  }
+#endif
+  if (UNLIKELY(c1->m_type == KindOfMulti)) {
+    START;
+    AS_MARITH;
+    // cases:
+    // I:   not with output buffer OR batch_size==1
+    // II:  ob_start has been used 
+    MultiVal* multi= c1->m_data.pmulti;
+
+    if (g_context->m_isMultiObs) {
+      // case 1:
+      g_context->write_multi(multi);
+    } else {
+      // case 2:
+      g_context->write("[{");
+      for (auto it : *multi) {
+        g_context->write(cellAsVariant(*it).toString());
+        g_context->write("|||");
+      }
+      g_context->write("}]");
+    }
+
+    END;
+  } else {
+    // normal case
+    g_context->write(cellAsVariant(*c1).toString());
+  }
   vmStack().replaceC<KindOfInt64>(1);
 }
 
+// curtis:
 OPTBLD_INLINE void iopClone(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   TypedValue* tv = vmStack().topTV();
-  if (tv->m_type != KindOfObject) {
+  if (tv->m_type == KindOfObject) {
+    // not multi-val
+    ObjectData* obj = tv->m_data.pobj;
+    const Class* class_ UNUSED = obj->getVMClass();
+    ObjectData* newobj = obj->clone();
+    vmStack().popTV(); // dec refcount
+    vmStack().pushNull();
+    tv->m_type = KindOfObject;
+    tv->m_data.pobj = newobj;
+  } else if (tv->m_type == KindOfMulti) {
+    START;
+    AS_MARITH;
+#ifdef CHENG_CHECK
+    cheng_assert(tv->m_data.pmulti->getType() == KindOfObject);
+#endif
+    TypedValue ret = MultiVal::cloneMultiVal(tv);
+
+    tvRefcountedDecRef(tv); // dec refcount
+    tvCopy(ret, *tv);
+    END;
+  } else {
     raise_error("clone called on non-object");
   }
-  ObjectData* obj = tv->m_data.pobj;
-  const Class* class_ UNUSED = obj->getVMClass();
-  ObjectData* newobj = obj->clone();
-  vmStack().popTV();
-  vmStack().pushNull();
-  tv->m_type = KindOfObject;
-  tv->m_data.pobj = newobj;
 }
 
+// Good to go
+// Will exit anyway
 OPTBLD_INLINE void iopExit(IOP_ARGS) {
   pc++;
   int exitCode = 0;
@@ -4120,6 +7269,8 @@ OPTBLD_INLINE void iopExit(IOP_ARGS) {
   throw ExitException(exitCode);
 }
 
+// Good to go
+// Fatal error anyway
 OPTBLD_INLINE void iopFatal(IOP_ARGS) {
   pc++;
   TypedValue* top = vmStack().topTV();
@@ -4149,19 +7300,25 @@ OPTBLD_INLINE void jmpSurpriseCheck(Offset offset) {
   }
 }
 
+// Good to go
 OPTBLD_INLINE void iopJmp(IOP_ARGS) {
+  AS_CF;
   pc++;
   auto offset = peek<Offset>(pc);
   jmpSurpriseCheck(offset);
   pc += offset - 1;
 }
 
+// Good to go
 OPTBLD_INLINE void iopJmpNS(IOP_ARGS) {
+  AS_CF;
   pc++;
   auto offset = peek<Offset>(pc);
   pc += offset - 1;
 }
 
+// cheng-hack:
+// If diverge, then assert false.
 template<Op op>
 OPTBLD_INLINE void jmpOpImpl(PC& pc) {
   static_assert(op == OpJmpZ || op == OpJmpNZ,
@@ -4171,6 +7328,97 @@ OPTBLD_INLINE void jmpOpImpl(PC& pc) {
   jmpSurpriseCheck(offset);
 
   Cell* c1 = vmStack().topC();
+
+  // cheng-hack:
+  Cell fst_cell;
+  if (UNLIKELY(c1->m_type == KindOfMulti)) {
+    START;
+    AS_MCF;
+    fst_cell.m_type = KindOfUninit;
+    // check if consistent
+    if (UNLIKELY(loop_capture_mode)) {
+      bool jump_forward = (offset > 0);
+      TypedValue *recent_exit_one = nullptr;
+      // check exit, which is jump
+      for (int i=0; i<c1->m_data.pmulti->valSize(); i++) {
+        // check if this has already been exit
+        if (loop_alive[i] == 0) continue;
+
+        bool exit = is_loop_exit(c1, i, jump_forward, op);
+        if (exit) {
+          recent_exit_one = c1->m_data.pmulti->getByVal(i);
+          // remember the output captured output 
+          auto loopv = tvToCell(&origin_loop_var_ref);
+          if (loopv->m_type == KindOfMulti) {
+            loopv = loopv->m_data.pmulti->getByVal(i);
+          }
+          auto capturev = tvToCell(&origin_capture_var_ref);
+          if (capturev->m_type == KindOfMulti) {
+            capturev = capturev->m_data.pmulti->getByVal(i);
+          }
+          cheng_assert(finish_loop_var[i].m_type == KindOfUninit);
+          cheng_assert(finish_capture_var[i].m_type == KindOfUninit);
+          tvCopy(*loopv, finish_loop_var[i]);
+          tvCopy(*capturev, finish_capture_var[i]);
+          // delete from mapping
+          loop_alive[i] = 0;
+
+#ifdef CHENG_INS_DEBUG
+          debug_log << "    loop exit var[" << i << "], cur_alive{ ";
+          for (auto it : loop_alive) {
+            debug_log << it << " ";
+          }
+          debug_log << "}\n";
+#endif
+        }
+      }
+      // construct c1
+      // find the mapping 1 as the delegate, if none, choose the recent_exit_one
+      for (int i=0; i<loop_alive.size(); i++) {
+        if (loop_alive[i]) {
+          fst_cell = *c1->m_data.pmulti->getByVal(i);
+        }
+      }
+      if (fst_cell.m_type == KindOfUninit) {
+        cheng_assert(recent_exit_one!=nullptr);
+        fst_cell = *recent_exit_one;
+      }
+      c1 = &fst_cell;
+      vmStack().popC(); // dec refcount
+      vmStack().pushNull();
+    } else {
+      bool first = true;
+      if (c1->m_data.pmulti->getType() == KindOfInt64 
+          || c1->m_data.pmulti->getType() == KindOfBoolean) {
+//int counter = 0;
+        for (auto it : *c1->m_data.pmulti) {
+          if (first) {
+            fst_cell = *it;
+            first = false;
+          }
+//std::cout << "[" << counter++ << "] fst_cell=" << fst_cell.pretty() << " vs. it=" << it->pretty() << "\n";
+          cheng_assert( (fst_cell.m_data.num == 0) == (it->m_data.num == 0) );
+        }
+      } else {
+        for (auto it : *c1->m_data.pmulti) {
+          if (first) {
+            fst_cell = *it;
+            first = false;
+          }
+          cheng_assert( toBoolean(cellAsCVarRef(fst_cell)) ==
+                        toBoolean(cellAsCVarRef(*it)) );
+        }
+      }
+
+      // after checking, give one as representation to the following code
+      c1 = &fst_cell;
+      vmStack().popC(); // dec refcount
+      vmStack().pushNull();
+    }
+    END;
+  }
+
+
   if (c1->m_type == KindOfInt64 || c1->m_type == KindOfBoolean) {
     int64_t n = c1->m_data.num;
     if (op == OpJmpZ ? n == 0 : n != 0) {
@@ -4192,15 +7440,21 @@ OPTBLD_INLINE void jmpOpImpl(PC& pc) {
   }
 }
 
+// cheng-hack: support by jmpOpImpl
 OPTBLD_INLINE void iopJmpZ(IOP_ARGS) {
+  AS_CF;
   jmpOpImpl<OpJmpZ>(pc);
 }
 
+// cheng-hack: support by jmpOpImpl
 OPTBLD_INLINE void iopJmpNZ(IOP_ARGS) {
+  AS_CF;
   jmpOpImpl<OpJmpNZ>(pc);
 }
 
+// cheng-hack: based on prev iter instructions
 OPTBLD_INLINE void iopIterBreak(IOP_ARGS) {
+  AS_CF;
   PC savedPc = pc;
   pc++;
   auto veclen = decode<int32_t>(pc);
@@ -4213,10 +7467,18 @@ OPTBLD_INLINE void iopIterBreak(IOP_ARGS) {
     Id iterType = iterTypeList[i];
     Id iterId   = iterIdList[i];
     Iter *iter = frame_iter(vmfp(), iterId);
+    // cheng-hack: iter can be a multi-iter
+    if (UNLIKELY(iter->isMulti())) {
+      // We will free the iter when next time 
+      // during Iterinit, see code in Iterinit's
+      // "used BUG" comment
+    } else {
+      // normal case
     switch (iterType) {
       case KindOfIter:  iter->free();  break;
       case KindOfMIter: iter->mfree(); break;
       case KindOfCIter: iter->cfree(); break;
+    }
     }
   }
   pc = savedPc + offset;
@@ -4237,7 +7499,9 @@ static SwitchMatch doubleCheck(double d, int64_t& out) {
   }
 }
 
+// Not Impl
 OPTBLD_INLINE void iopSwitch(IOP_ARGS) {
+  AS_CF;
   PC origPC = pc;
   pc++;
   auto veclen = decode<int32_t>(pc);
@@ -4248,6 +7512,9 @@ OPTBLD_INLINE void iopSwitch(IOP_ARGS) {
   auto bounded = decode_iva(pc);
 
   TypedValue* val = vmStack().topTV();
+#ifdef CHENG_CHECK
+  cheng_assert(val->m_type != KindOfMulti);
+#endif
   if (!bounded) {
     assert(val->m_type == KindOfInt64);
     // Continuation switch: no bounds checking needed
@@ -4306,6 +7573,7 @@ OPTBLD_INLINE void iopSwitch(IOP_ARGS) {
             case KindOfObject:
             case KindOfResource:
             case KindOfRef:
+            case KindOfMulti:
             case KindOfClass:
               not_reached();
           }
@@ -4329,6 +7597,7 @@ OPTBLD_INLINE void iopSwitch(IOP_ARGS) {
           return;
 
         case KindOfRef:
+        case KindOfMulti:
         case KindOfClass:
           break;
       }
@@ -4354,7 +7623,9 @@ OPTBLD_INLINE void iopSwitch(IOP_ARGS) {
   }
 }
 
+// Not Impl
 OPTBLD_INLINE void iopSSwitch(IOP_ARGS) {
+  AS_CF;
   PC origPC = pc;
   pc++;
   auto veclen = decode<int32_t>(pc);
@@ -4364,6 +7635,9 @@ OPTBLD_INLINE void iopSSwitch(IOP_ARGS) {
   pc += veclen * sizeof(*jmptab);
 
   Cell* val = tvToCell(vmStack().topTV());
+#ifdef CHENG_CHECK
+  cheng_assert(val->m_type != KindOfMulti);
+#endif
   Unit* u = vmfp()->m_func->unit();
   unsigned i;
   for (i = 0; i < cases; ++i) {
@@ -4384,6 +7658,10 @@ OPTBLD_INLINE void iopSSwitch(IOP_ARGS) {
 OPTBLD_INLINE void ret(PC& pc) {
   // Get the return value.
   TypedValue retval = *vmStack().topTV();
+
+#ifdef CHENG_INS_DEBUG
+  debug_log << "    ret value: " << retval.pretty() << "\n";
+#endif
 
   // Free $this and local variables. Calls FunctionReturn hook. The return value
   // is kept on the stack so that the unwinder would free it if the hook fails.
@@ -4445,26 +7723,37 @@ OPTBLD_INLINE void ret(PC& pc) {
   pc = LIKELY(vmfp() != nullptr) ? vmfp()->func()->getEntry() + soff : nullptr;
 }
 
+// Good to go
 OPTBLD_INLINE void iopRetC(IOP_ARGS) {
+  AS_CF;
   pc++;
   ret(pc);
 }
 
+// Good to go
 OPTBLD_INLINE void iopRetV(IOP_ARGS) {
+  AS_CF;
   pc++;
   assert(!vmfp()->resumed());
   assert(!vmfp()->func()->isResumable());
   ret(pc);
 }
 
+// Good to go
 OPTBLD_INLINE void iopUnwind(IOP_ARGS) {
+  AS_CF;
   assert(!g_context->m_faults.empty());
   assert(g_context->m_faults.back().m_raiseOffset != kInvalidOffset);
   throw VMPrepareUnwind();
 }
 
+// Good to go
 OPTBLD_INLINE void iopThrow(IOP_ARGS) {
+  AS_CF;
   Cell* c1 = vmStack().topC();
+#ifdef CHENG_CHECK
+  cheng_assert(c1->m_type != KindOfMulti);
+#endif
   if (c1->m_type != KindOfObject ||
       !c1->m_data.pobj->instanceof(SystemLib::s_ExceptionClass)) {
     raise_error("Exceptions must be valid objects derived from the "
@@ -4477,17 +7766,27 @@ OPTBLD_INLINE void iopThrow(IOP_ARGS) {
   throw obj;
 }
 
+// Good to go
 OPTBLD_INLINE void iopAGetC(IOP_ARGS) {
+  AS_GET;
   pc++;
   TypedValue* tv = vmStack().topTV();
+#ifdef CHENG_CHECK
+  cheng_assert(LIKELY(tv->m_type != KindOfMulti));
+#endif
   lookupClsRef(tv, tv, true);
 }
 
+// Good to go
 OPTBLD_INLINE void iopAGetL(IOP_ARGS) {
+  AS_GET;
   pc++;
   auto local = decode_la(pc);
   vmStack().pushUninit();
   TypedValue* fr = frame_local_inner(vmfp(), local);
+#ifdef CHENG_CHECK
+  cheng_assert(fr->m_type != KindOfMulti);
+#endif
   lookupClsRef(fr, vmStack().top());
 }
 
@@ -4497,11 +7796,42 @@ static void raise_undefined_local(ActRec* fp, Id pind) {
                fp->m_func->localVarName(pind)->data());
 }
 
-static inline void cgetl_inner_body(TypedValue* fr, TypedValue* to) {
-  assert(fr->m_type != KindOfUninit);
-  cellDup(*tvToCell(fr), *to);
+// cheng-hack:
+// Try to deref multiRef here
+// 
+// used by CGetL/CGetL2/CGetL3/FPassL (by cgetl_body)
+//         CGetN/CGetG
+static inline void cgetl_inner_body(TypedValue* src_fr, TypedValue* to) {
+  assert(src_fr->m_type != KindOfUninit);
+  auto fr = tvToCell(src_fr);
+  if (UNLIKELY(fr->m_type == KindOfMulti
+               && fr->m_data.pmulti->getType() == KindOfRef)) {
+    START;
+    AS_MGET;
+#ifdef CHENG_INS_ONLY_DEBUG
+    if (should_count) debug_log << "    cgetl_inner: deref the multi-ref to multi-val\n";
+#endif
+    // create new multiVal
+    TypedValue ret = MultiVal::makeMultiVal();
+    for (auto it : *fr->m_data.pmulti) {
+      // deref multiRef
+      ret.m_data.pmulti->addValue(*tvToCell(it));
+    }
+    tvCopy(ret, *to);
+    END;
+  } else {
+#ifdef CHENG_INS_DEBUG
+    debug_log << "    cgetl_inner: deref the ref as normal, " << fr->pretty() << "\n";
+    if (tvToCell(fr)->m_type == KindOfMulti) {
+      debug_log << "       {{ " << tvToCell(fr)->m_data.pmulti->dump("    ") << "}}\n";
+    }
+#endif
+    // normal case
+    cellDup(*fr, *to);
+  }
 }
 
+// cheng-hack: used by CGetL/CGetL2/CGetL3/FPassL
 static inline void cgetl_body(ActRec* fp,
                               TypedValue* fr,
                               TypedValue* to,
@@ -4516,15 +7846,27 @@ static inline void cgetl_body(ActRec* fp,
   }
 }
 
+// cheng-hack: support in cgetl_inner_body
 OPTBLD_INLINE void iopCGetL(IOP_ARGS) {
+  AS_GET;
   pc++;
   auto local = decode_la(pc);
   Cell* to = vmStack().allocC();
   TypedValue* fr = frame_local(vmfp(), local);
+#ifdef CHENG_INS_DEBUG
+  auto txt = HHVM_FN(print_r)(tvAsVariant(fr), true);
+  debug_log << "  Local: " << fr->pretty() << " : {{"
+    << txt.toString().toCppString() << "}}\n";
+#endif
+#ifdef CHENG_INS_ONLY_DEBUG
+  if(should_count) debug_log << "    cgetl: " << fr->pretty() << "\n";
+#endif
   cgetl_body(vmfp(), fr, to, local);
 }
 
+// cheng-hack: support in cgetl_inner_body
 OPTBLD_INLINE void iopCGetL2(IOP_ARGS) {
+  AS_GET;
   pc++;
   auto local = decode_la(pc);
   TypedValue* oldTop = vmStack().topTV();
@@ -4532,10 +7874,17 @@ OPTBLD_INLINE void iopCGetL2(IOP_ARGS) {
   memcpy(newTop, oldTop, sizeof *newTop);
   Cell* to = oldTop;
   TypedValue* fr = frame_local(vmfp(), local);
+#ifdef CHENG_INS_DEBUG
+  auto txt = HHVM_FN(print_r)(tvAsVariant(fr), true);
+  debug_log << "  Local: " << fr->pretty() << " : {{"
+    << txt.toString().toCppString() << "}}\n";
+#endif
   cgetl_body(vmfp(), fr, to, local);
 }
 
+// cheng-hack: support in cgetl_inner_body
 OPTBLD_INLINE void iopCGetL3(IOP_ARGS) {
+  AS_GET;
   pc++;
   auto local = decode_la(pc);
   TypedValue* oldTop = vmStack().topTV();
@@ -4547,6 +7896,7 @@ OPTBLD_INLINE void iopCGetL3(IOP_ARGS) {
   cgetl_body(vmfp(), fr, to, local);
 }
 
+// Good to go
 OPTBLD_INLINE void iopPushL(IOP_ARGS) {
   pc++;
   auto local = decode_la(pc);
@@ -4559,10 +7909,15 @@ OPTBLD_INLINE void iopPushL(IOP_ARGS) {
   locVal->m_type = KindOfUninit;
 }
 
+// Good to go
 OPTBLD_INLINE void iopCGetN(IOP_ARGS) {
+  AS_GET;
   pc++;
   StringData* name;
   TypedValue* to = vmStack().topTV();
+#ifdef CHENG_CHECK
+  cheng_assert(to->m_type != KindOfMulti);
+#endif
   TypedValue* fr = nullptr;
   lookup_var(vmfp(), name, to, fr);
   if (fr == nullptr || fr->m_type == KindOfUninit) {
@@ -4576,10 +7931,19 @@ OPTBLD_INLINE void iopCGetN(IOP_ARGS) {
   decRefStr(name); // TODO(#1146727): leaks during exceptions
 }
 
+// Good to go
+// FIXME: check the single_mode!
 OPTBLD_INLINE void iopCGetG(IOP_ARGS) {
+  AS_GET;
   pc++;
   StringData* name;
   TypedValue* to = vmStack().topTV();
+  
+  // cheng-hack: "to" is used as key here
+#ifdef CHENG_CHECK
+  cheng_assert(to->m_type != KindOfMulti);
+#endif
+
   TypedValue* fr = nullptr;
   lookup_gbl(vmfp(), name, to, fr);
   if (fr == nullptr) {
@@ -4594,7 +7958,7 @@ OPTBLD_INLINE void iopCGetG(IOP_ARGS) {
     tvWriteNull(to);
   } else {
     tvRefcountedDecRef(to);
-    cgetl_inner_body(fr, to);
+    cgetl_inner_body(fr, to); // suppored by inner
   }
   decRefStr(name); // TODO(#1146727): leaks during exceptions
 }
@@ -4609,9 +7973,16 @@ struct SpropState {
   bool accessible;
 };
 
+// cheng-hack: Not Impl
+// Used by IssetS/IsEmptyS/IncDecS
+//         CGetS/VGetS (through getS())
 static void spropInit(SpropState& ss) {
   ss.clsref = vmStack().topTV();
   ss.nameCell = vmStack().indTV(1);
+#ifdef CHENG_CHECK
+  cheng_assert(ss.clsref->m_type != KindOfMulti);
+  cheng_assert(ss.nameCell->m_type != KindOfMulti);
+#endif
   ss.output = ss.nameCell;
   lookup_sprop(vmfp(), ss.clsref, ss.name, ss.nameCell, ss.val, ss.visible,
                ss.accessible);
@@ -4621,7 +7992,16 @@ static void spropFinish(SpropState& ss) {
   decRefStr(ss.name);
 }
 
+
+// cheng-hack:
+// This is static class variables, can be multi-value
 template<bool box> void getS(PC& pc) {
+  //cheng-hack: for CGetS/VGetS
+#ifdef CHENG_CHECK
+  cheng_assert(vmStack().topTV()->m_type != KindOfMulti);
+  cheng_assert(vmStack().indTV(1)->m_type != KindOfMulti);
+#endif
+
   pc++;
   SpropState ss;
   spropInit(ss);
@@ -4630,9 +8010,10 @@ template<bool box> void getS(PC& pc) {
                 ss.clsref->m_data.pcls->name()->data(),
                 ss.name->data());
   }
+
   if (box) {
     if (ss.val->m_type != KindOfRef) {
-      tvBox(ss.val);
+      tvBox(ss.val); // ss.val can be multi, then ref-to-multi
     }
     refDup(*ss.val, *ss.output);
   } else {
@@ -4642,27 +8023,58 @@ template<bool box> void getS(PC& pc) {
   spropFinish(ss);
 }
 
+// Not Impl, see getS()
 OPTBLD_INLINE void iopCGetS(IOP_ARGS) {
+  AS_GET;
   getS<false>(pc);
 }
 
+// curtis:
+// cheng-hack: supported by memberHelperPre
 OPTBLD_INLINE void iopCGetM(IOP_ARGS) {
+  AS_MEMBER;
   pc++;
   MemberState mstate;
+  // NOTE: for ins_counter to avoid __get()
+#ifdef CHENG_COUNT_INS
+  nested_ins_level_inc(); 
+#endif
+  // NOTE: multiVal has already been handled here
   auto tvRet = getHelper(pc, mstate);
   if (tvRet->m_type == KindOfRef) {
     tvUnbox(tvRet);
   }
+#ifdef CHENG_COUNT_INS
+  nested_ins_level_dec();
+#endif
 }
 
+// cheng-hack:
+//   used by VGetL/VGetN/VGetG/FPassL
 static inline void vgetl_body(TypedValue* fr, TypedValue* to) {
-  if (fr->m_type != KindOfRef) {
-    tvBox(fr);
+  // cheng-hack: 
+  if (UNLIKELY(fr->m_type == KindOfMulti)) {
+    START;
+    AS_MGET;
+    // If fr is multi-ref, just copy; otherwise, make a ref-to-multi
+    if (fr->m_data.pmulti->getType() != KindOfRef) {
+      tvBox(fr);
+    }
+    // NOTE: see NOTE(1)
+    tvDup(*fr, *to);
+    END;
+  } else {
+    // normal case
+    if (fr->m_type != KindOfRef) {
+      tvBox(fr);
+    }
+    refDup(*fr, *to);
   }
-  refDup(*fr, *to);
 }
 
+// cheng-hack: supported by vgetl_body()
 OPTBLD_INLINE void iopVGetL(IOP_ARGS) {
+  AS_GET;
   pc++;
   auto local = decode_la(pc);
   Ref* to = vmStack().allocV();
@@ -4670,10 +8082,15 @@ OPTBLD_INLINE void iopVGetL(IOP_ARGS) {
   vgetl_body(fr, to);
 }
 
+// cheng-hack: supported by vgetl_body()
 OPTBLD_INLINE void iopVGetN(IOP_ARGS) {
+  AS_GET;
   pc++;
   StringData* name;
   TypedValue* to = vmStack().topTV();
+#ifdef CHENG_CHECK
+  cheng_assert(to->m_type != KindOfMulti);
+#endif
   TypedValue* fr = nullptr;
   lookupd_var(vmfp(), name, to, fr);
   assert(fr != nullptr);
@@ -4682,63 +8099,169 @@ OPTBLD_INLINE void iopVGetN(IOP_ARGS) {
   decRefStr(name);
 }
 
+// cheng-hack: supported by vgetl_body()
+// FIXME: single-mode support needed
 OPTBLD_INLINE void iopVGetG(IOP_ARGS) {
+  AS_GET;
   pc++;
   StringData* name;
   TypedValue* to = vmStack().topTV();
   TypedValue* fr = nullptr;
+
+  // cheng-hack:
+#ifdef CHENG_CHECK
+  cheng_assert(to->m_type != KindOfMulti);
+#endif
+
   lookupd_gbl(vmfp(), name, to, fr);
   assert(fr != nullptr);
   tvRefcountedDecRef(to);
-  vgetl_body(fr, to);
+  vgetl_body(fr, to); // supported inside
   decRefStr(name);
 }
 
+// Supported, see getS()
 OPTBLD_INLINE void iopVGetS(IOP_ARGS) {
+  AS_GET;
   getS<true>(pc);
 }
 
+// cheng-hack:
 OPTBLD_INLINE void iopVGetM(IOP_ARGS) {
+  AS_MEMBER;
   pc++;
   MemberState mstate;
+  // cheng-hack:
+  mstate.isMultiBase = false;
+  mstate.isVGetM = true;
+#ifdef CHENG_COUNT_INS
+  nested_ins_level_inc();
+#endif
+
   TypedValue* tv1 = vmStack().allocTV();
   tvWriteUninit(tv1);
   if (!setHelperPre<false, true, false, true, 1,
       VectorLeaveCode::ConsumeAll>(pc, mstate)) {
-    if (mstate.base->m_type != KindOfRef) {
-      tvBox(mstate.base);
+    // cheng-hack:
+    if (UNLIKELY(mstate.isMultiBase)) {
+      // (1) Init 
+      TypedValue result = MultiVal::makeMultiVal();
+      // (2) fetch each val from base_list
+      for (auto it : *mstate.base_list) {
+#ifdef CHENG_INS_DEBUG
+        debug_log << "  This is VGetM element: " << it->pretty() << "\n";
+#endif
+        // (3) do the job
+        TypedValue tmpTV;
+        if (it->m_type != KindOfRef) {
+          tvBox(it);
+        }
+        refDup(*it, tmpTV); // increase the ref count
+        result.m_data.pmulti->addValueNoInc(tmpTV); // no need to increase
+      }
+      // do shrink
+      auto single = result.m_data.pmulti->shrinkToSingle();
+      if (single == nullptr) {
+        // copy the result to the right place
+        // result is a multi-ref
+        tvCopy(result, *tv1);
+#ifdef CHENG_INS_DEBUG
+      debug_log << "  The return value is:\n" << tv1->m_data.pmulti->dump("  ");
+#endif
+      } else {
+        refDup(*single, *tv1);
+        tvDecRef(&result);
+      }
+    } else {
+      // original case
+      if (mstate.base->m_type != KindOfRef) {
+        tvBox(mstate.base);
+      }
+      refDup(*mstate.base, *tv1);
     }
-    refDup(*mstate.base, *tv1);
   } else {
     tvWriteNull(tv1);
     tvBox(tv1);
   }
   setHelperPost<1>(mstate.ndiscard);
+#ifdef CHENG_COUNT_INS
+  nested_ins_level_dec();
+#endif
 }
 
+// cheng-hack:
 OPTBLD_INLINE void iopIssetN(IOP_ARGS) {
+  AS_ISSET;
   pc++;
   StringData* name;
-  TypedValue* tv1 = vmStack().topTV();
+  TypedValue* tv1 = vmStack().topTV(); // this is name
+  // cheng-hack:
+#ifdef CHENG_CHECK
+  cheng_assert(tv1->m_type != KindOfMulti);
+#endif
   TypedValue* tv = nullptr;
   bool e;
   lookup_var(vmfp(), name, tv1, tv);
+  // cheng-hack:
+  if (UNLIKELY(tv!=nullptr && tv->m_type == KindOfMulti)) {
+    START;
+    AS_MISSET;
+    TypedValue ret = MultiVal::makeMultiVal();
+    for (auto it : *tv->m_data.pmulti) {
+      e = !cellIsNull(tvToCell(it));
+      TypedValue tmp;
+      tmp.m_type = KindOfBoolean;
+      tmp.m_data.num = e;
+      ret.m_data.pmulti->addValue(tmp);
+    }
+    // copy ret to the right place
+    tvCopy(ret, *vmStack().topTV());
+    decRefStr(name);
+    END;
+  } else {
+    // normal case
   if (tv == nullptr) {
     e = false;
   } else {
     e = !cellIsNull(tvToCell(tv));
-  }
+    }
   vmStack().replaceC<KindOfBoolean>(e);
   decRefStr(name);
+  }
 }
 
+// cheng-hack:
 OPTBLD_INLINE void iopIssetG(IOP_ARGS) {
+  AS_ISSET;
   pc++;
   StringData* name;
-  TypedValue* tv1 = vmStack().topTV();
+  TypedValue* tv1 = vmStack().topTV(); // this is name
+  // cheng-hack:
+#ifdef CHENG_CHECK
+  cheng_assert(tv1->m_type != KindOfMulti);
+#endif
   TypedValue* tv = nullptr;
   bool e;
   lookup_gbl(vmfp(), name, tv1, tv);
+  // cheng-hack:
+  // TODO: don't know how to construct IssetG (later: what does this mean?)
+  if (UNLIKELY(tv!=nullptr && tv->m_type == KindOfMulti)) {
+    START;
+    AS_MISSET;
+    TypedValue ret = MultiVal::makeMultiVal();
+    for (auto it : *tv->m_data.pmulti) {
+      e = !cellIsNull(tvToCell(it));
+      TypedValue tmp;
+      tmp.m_type = KindOfBoolean;
+      tmp.m_data.num = e;
+      ret.m_data.pmulti->addValue(tmp);
+    }
+    // copy ret to the right place
+    tvCopy(ret, *vmStack().topTV());
+    decRefStr(name);
+    END;
+  } else {
+    // normal case
   if (tv == nullptr) {
     e = false;
   } else {
@@ -4746,9 +8269,12 @@ OPTBLD_INLINE void iopIssetG(IOP_ARGS) {
   }
   vmStack().replaceC<KindOfBoolean>(e);
   decRefStr(name);
+  }
 }
 
+// Not Impl, see spropInit()
 OPTBLD_INLINE void iopIssetS(IOP_ARGS) {
+  AS_ISSET;
   pc++;
   SpropState ss;
   spropInit(ss);
@@ -4764,22 +8290,73 @@ OPTBLD_INLINE void iopIssetS(IOP_ARGS) {
   spropFinish(ss);
 }
 
+// cheng-hack: used by IssetM/EmptyM
 template <bool isEmpty>
 OPTBLD_INLINE void isSetEmptyM(PC& pc) {
   pc++;
   MemberState mstate;
+  // cheng-hack:
+  mstate.isMultiBase = false;
+  mstate.isVGetM = false;
+
   getHelperPre<false,false,VectorLeaveCode::LeaveLast>(pc, mstate);
   // Process last member specially, in order to employ the IssetElem/IssetProp
   // operations.
   bool isSetEmptyResult = false;
+
+#ifdef CHENG_COUNT_INS
+  nested_ins_level_inc();
+#endif
+  // cheng-hack:
+  bool multi_base = false, multi_index = false;
+  int multi_num = 1;
+  TypedValue* base = mstate.base;
+  TypedValue* curMember = mstate.curMember;
+  TypedValue multi_ret;
+  TypedValue tmp_args[mstate.ndiscard];
+
+  if (UNLIKELY(mstate.isMultiBase)) {
+    multi_base = true;
+    multi_num = mstate.base_list->size();
+  }
+  if (UNLIKELY(mstate.curMember->m_type == KindOfMulti)) {
+    multi_index = true;
+    multi_num = mstate.curMember->m_data.pmulti->valSize();
+  }
+  if (UNLIKELY(multi_base || multi_index)) {
+    multi_ret = MultiVal::makeMultiVal(); 
+    memcpy(tmp_args, vmStack().topTV(), sizeof(TypedValue)*mstate.ndiscard);
+  }
+
+#ifdef CHENG_CHECK
+  if (multi_base) cheng_assert(mstate.base_list->size() == multi_num);
+  if (multi_index) cheng_assert(mstate.curMember->m_data.pmulti->valSize() == multi_num);
+#endif
+
+#ifdef CHENG_INS_ONLY_DEBUG
+  debug_log << "  multi_base(" << multi_base << "), multi_index(" << multi_index << ") \n";
+  if (!multi_base) {
+    debug_log << "   single base => " << mstate.base->pretty() << "\n";
+  }
+#endif
+
+  if (UNLIKELY(multi_base || multi_index )) {START; AS_MMEMBER;}
+
+  for (int i = 0; i < multi_num; i++) {
+    if (UNLIKELY(multi_base || multi_index)) {
+      if (multi_base) base = (*mstate.base_list)[i];
+      if (multi_index) curMember = mstate.curMember->m_data.pmulti->getByVal(i);
+    }
+    // cheng-hack: NOTE: I assume that the following snippet will not affecte mstate
+
   switch (mstate.mcode) {
     case MEL:
     case MEC:
     case MET:
     case MEI: {
       isSetEmptyResult = IssetEmptyElem<isEmpty>(
-        mstate.scratch, *mstate.ref.asTypedValue(), mstate.base,
-        *mstate.curMember
+        mstate.scratch, *mstate.ref.asTypedValue(), base,
+        *curMember
       );
       break;
     }
@@ -4788,7 +8365,7 @@ OPTBLD_INLINE void isSetEmptyM(PC& pc) {
     case MPT: {
       Class* ctx = arGetContextClass(vmfp());
       isSetEmptyResult = IssetEmptyProp<isEmpty>(
-        ctx, mstate.base, *mstate.curMember
+        ctx, base, *curMember
       );
       break;
     }
@@ -4796,23 +8373,83 @@ OPTBLD_INLINE void isSetEmptyM(PC& pc) {
     case InvalidMemberCode:
       assert(false);
   }
+
+  // cheng-hack: collect the result
+  if (UNLIKELY(multi_base || multi_index)) {
+    TypedValue tmp;
+    tmp.m_type = KindOfBoolean;
+    tmp.m_data.num = isSetEmptyResult;
+    multi_ret.m_data.pmulti->addValue(tmp);
+  }
+  }
+
+  // cheng-hack: copy to stack
+  if (UNLIKELY(multi_base || multi_index)) {
+    memcpy(vmStack().topTV(), tmp_args, sizeof(TypedValue)*mstate.ndiscard);
+    auto tvRet = getHelperPost(mstate.ndiscard);
+#ifdef CHENG_INS_DEBUG
+    auto txt = HHVM_FN(print_r)(tvAsVariant(&multi_ret), true);
+    debug_log << "    IssetM MultiVal Result: {{" 
+      << txt.toString().toCppString() << "}}\n";
+#endif
+    tvCopy(multi_ret, *tvRet);
+    END;
+  } else {
+    // normal case
   auto tvRet = getHelperPost(mstate.ndiscard);
   tvRet->m_data.num = isSetEmptyResult;
   tvRet->m_type = KindOfBoolean;
+  }
+#ifdef CHENG_COUNT_INS
+  nested_ins_level_dec();
+#endif
 }
 
+// Supported, see isSetEmptyM()
 OPTBLD_INLINE void iopIssetM(IOP_ARGS) {
+  AS_MEMBER;
   isSetEmptyM<false>(pc);
 }
 
+// Supported
 OPTBLD_INLINE void iopIssetL(IOP_ARGS) {
+  AS_ISSET;
   pc++;
   auto local = decode_la(pc);
   TypedValue* tv = frame_local(vmfp(), local);
+  // cheng-hack:
+  if (UNLIKELY(tv->m_type == KindOfMulti)) {
+    START;
+    AS_MISSET;
+    TypedValue ret = MultiVal::makeMultiVal();
+    for (auto it : *tv->m_data.pmulti) {
+      TypedValue tmp;
+      tmp.m_type = KindOfBoolean;
+      tmp.m_data.num = is_not_null(tvAsCVarRef(it));
+      ret.m_data.pmulti->addValue(tmp);
+    }
+
+    TypedValue* topTv = vmStack().allocTV();
+    // usually should be the same
+    auto single = ret.m_data.pmulti->shrinkToSingle();
+    if (single == nullptr) {
+      tvCopy(ret, *topTv);
+    } else {
+      //topTv->m_data.num = single->m_data.num;
+      //topTv->m_type = KindOfBoolean;
+      tvDup(*single, *topTv);
+      // FIXME: for performance reason, we may just let it go
+      // free the multivalue
+      tvDecRef(&ret);
+    }
+    END;
+  } else {
+    // normal case
   bool ret = is_not_null(tvAsCVarRef(tv));
   TypedValue* topTv = vmStack().allocTV();
   topTv->m_data.num = ret;
   topTv->m_type = KindOfBoolean;
+  }
 }
 
 OPTBLD_INLINE static bool isTypeHelper(TypedValue* tv, IsTypeOp op) {
@@ -4829,7 +8466,10 @@ OPTBLD_INLINE static bool isTypeHelper(TypedValue* tv, IsTypeOp op) {
   not_reached();
 }
 
+// cheng-hack:
+//  One MultiVal may have NULL
 OPTBLD_INLINE void iopIsTypeL(IOP_ARGS) {
+  AS_ISSET;
   pc++;
   auto local = decode_la(pc);
   auto op = decode_oa<IsTypeOp>(pc);
@@ -4837,22 +8477,93 @@ OPTBLD_INLINE void iopIsTypeL(IOP_ARGS) {
   if (tv->m_type == KindOfUninit) {
     raise_undefined_local(vmfp(), local);
   }
+
+  // cheng-hack:
+  // MultiVal should have same type or NULL
+  // If tv is a multivalue or it is a ref to the multivalue
+  if (UNLIKELY(tv->m_type == KindOfMulti ||
+               (tv->m_type == KindOfRef && tv->m_data.pref->tv()->m_type == KindOfMulti)
+               )) {
+    START;
+    AS_MISSET;
+
+    if (tv->m_type == KindOfRef) {
+      tv = tv->m_data.pref->tv();
+    }
+
+    TypedValue ret = MultiVal::makeMultiVal(); 
+    for (auto it : *tv->m_data.pmulti) {
+      TypedValue tmp;
+      tmp.m_data.num = isTypeHelper(it, op);
+      tmp.m_type = KindOfBoolean;
+      ret.m_data.pmulti->addValue(tmp);
+    }
+    // Optimization, shrink, not sure if good for performance or bad
+    TypedValue *shrink = ret.m_data.pmulti->shrinkToSingle();
+    TypedValue* topTv = vmStack().allocTV();
+
+    if (shrink == nullptr) {
+      tvCopy(ret, *topTv); 
+    } else {
+#ifdef CHENG_INS_DEBUG
+      debug_log << "    Shrink the result to single: " << shrink->pretty() << "\n";
+#endif
+      tvDup(*shrink, *topTv); 
+      tvRefcountedDecRef(&ret);
+    }
+    END;
+  } else {
+  // original case
   TypedValue* topTv = vmStack().allocTV();
   topTv->m_data.num = isTypeHelper(tv, op);
   topTv->m_type = KindOfBoolean;
+  }
 }
 
+// cheng-hack:
+//  One MultiVal may have NULL
 OPTBLD_INLINE void iopIsTypeC(IOP_ARGS) {
+  AS_ISSET;
   pc++;
   auto op = decode_oa<IsTypeOp>(pc);
   TypedValue* topTv = vmStack().topTV();
   assert(topTv->m_type != KindOfRef);
-  bool ret = isTypeHelper(topTv, op);
-  tvRefcountedDecRef(topTv);
-  topTv->m_data.num = ret;
-  topTv->m_type = KindOfBoolean;
+
+  bool ret = false;
+  // cheng-hack:
+  // MultiVal should have same type
+  if (UNLIKELY(topTv->m_type == KindOfMulti)) {
+    START;
+    AS_MISSET;
+    TypedValue ret = MultiVal::makeMultiVal(); 
+    for (auto it : *topTv->m_data.pmulti) {
+      TypedValue tmp;
+      tmp.m_data.num = isTypeHelper(it, op);
+      tmp.m_type = KindOfBoolean;
+      ret.m_data.pmulti->addValue(tmp);
+    }
+    // Optimization, shrink, not sure if good for performance or bad
+    TypedValue *shrink = ret.m_data.pmulti->shrinkToSingle();
+    if (shrink == nullptr) {
+      tvCopy(ret, *topTv); 
+    } else {
+#ifdef CHENG_INS_DEBUG
+      debug_log << "    Shrink the result to single: " << shrink->pretty() << "\n";
+#endif
+      tvDup(*shrink, *topTv); 
+      tvRefcountedDecRef(&ret);
+    }
+    END;
+  } else {
+    // original case
+    ret = isTypeHelper(topTv, op);
+    tvRefcountedDecRef(topTv);
+    topTv->m_data.num = ret;
+    topTv->m_type = KindOfBoolean;
+  }
 }
 
+// Good to go
 OPTBLD_INLINE void iopAssertRATL(IOP_ARGS) {
   pc++;
   auto localId = decode_la(pc);
@@ -4877,6 +8588,7 @@ OPTBLD_INLINE void iopAssertRATL(IOP_ARGS) {
   pc += encodedRATSize(pc);
 }
 
+// Good to go
 OPTBLD_INLINE void iopAssertRATStk(IOP_ARGS) {
   pc++;
   auto stkSlot = decode_iva(pc);
@@ -4898,51 +8610,140 @@ OPTBLD_INLINE void iopAssertRATStk(IOP_ARGS) {
   pc += encodedRATSize(pc);
 }
 
+// Good to go
 OPTBLD_INLINE void iopBreakTraceHint(IOP_ARGS) {
   pc++;
 }
 
+// Support
 OPTBLD_INLINE void iopEmptyL(IOP_ARGS) {
+  AS_ISSET;
   pc++;
   auto local = decode_la(pc);
   TypedValue* loc = frame_local(vmfp(), local);
+  // cheng-hack:
+  if (UNLIKELY(loc->m_type == KindOfMulti)) {
+    START;
+    AS_MISSET;
+    TypedValue ret = MultiVal::makeMultiVal();
+    for (auto it : *loc->m_data.pmulti) {
+      bool e = !cellToBool(*tvToCell(it));
+      TypedValue tmp;
+      tmp.m_type = KindOfBoolean;
+      tmp.m_data.num = e;
+      ret.m_data.pmulti->addValue(tmp);
+    }
+    // usually should be the same
+    TypedValue *shrink = ret.m_data.pmulti->shrinkToSingle();
+    if (shrink == nullptr) {
+      vmStack().pushMultiObject(ret);
+    } else {
+      vmStack().pushBool(shrink->m_data.num);
+      tvDecRef(&ret);
+    }
+    END;
+  } else {
+    // normal case
   bool e = !cellToBool(*tvToCell(loc));
   vmStack().pushBool(e);
+  }
 }
 
+// Support
 OPTBLD_INLINE void iopEmptyN(IOP_ARGS) {
+  AS_ISSET;
   pc++;
   StringData* name;
   TypedValue* tv1 = vmStack().topTV();
+  // cheng-hack:
+  cheng_assert(tv1->m_type != KindOfMulti);
   TypedValue* tv = nullptr;
   bool e;
   lookup_var(vmfp(), name, tv1, tv);
   if (tv == nullptr) {
     e = true;
+    vmStack().replaceC<KindOfBoolean>(e);
   } else {
-    e = !cellToBool(*tvToCell(tv));
+    // cheng-hack:
+    if (UNLIKELY(tv->m_type == KindOfMulti)) {
+      START;
+      AS_MISSET;
+      TypedValue ret = MultiVal::makeMultiVal();
+      for (auto it : *tv->m_data.pmulti) {
+        bool e = !cellToBool(*tvToCell(it));
+        TypedValue tmp;
+        tmp.m_type = KindOfBoolean;
+        tmp.m_data.num = e;
+        ret.m_data.pmulti->addValue(tmp);
+      }
+      vmStack().discard();
+      // usually should be the same
+      TypedValue *shrink = ret.m_data.pmulti->shrinkToSingle();
+      if (shrink == nullptr) {
+        vmStack().pushMultiObject(ret);
+      } else {
+        vmStack().pushBool(shrink->m_data.num);
+        tvDecRef(&ret);
+      }
+      END;
+    } else {
+      // normal case
+      e = !cellToBool(*tvToCell(tv));
+      vmStack().replaceC<KindOfBoolean>(e);
+    }
   }
-  vmStack().replaceC<KindOfBoolean>(e);
   decRefStr(name);
 }
 
+// Support
 OPTBLD_INLINE void iopEmptyG(IOP_ARGS) {
+  AS_ISSET;
   pc++;
   StringData* name;
   TypedValue* tv1 = vmStack().topTV();
+  // cheng-hack:
+  cheng_assert(tv1->m_type != KindOfMulti);
   TypedValue* tv = nullptr;
   bool e;
   lookup_gbl(vmfp(), name, tv1, tv);
   if (tv == nullptr) {
     e = true;
+    vmStack().replaceC<KindOfBoolean>(e);
   } else {
-    e = !cellToBool(*tvToCell(tv));
+    // cheng-hack:
+    if (UNLIKELY(tv->m_type == KindOfMulti)) {
+      START;
+      AS_MISSET;
+      TypedValue ret = MultiVal::makeMultiVal();
+      for (auto it : *tv->m_data.pmulti) {
+        bool e = !cellToBool(*tvToCell(it));
+        TypedValue tmp;
+        tmp.m_type = KindOfBoolean;
+        tmp.m_data.num = e;
+        ret.m_data.pmulti->addValue(tmp);
+      }
+      vmStack().discard();
+      // usually should be the same
+      TypedValue *shrink = ret.m_data.pmulti->shrinkToSingle();
+      if (shrink == nullptr) {
+        vmStack().pushMultiObject(ret);
+      } else {
+        vmStack().pushBool(shrink->m_data.num);
+        tvDecRef(&ret);
+      }
+      END;
+    } else {
+      // normal case
+      e = !cellToBool(*tvToCell(tv));
+      vmStack().replaceC<KindOfBoolean>(e);
+    }
   }
-  vmStack().replaceC<KindOfBoolean>(e);
   decRefStr(name);
 }
 
+// Not Impl, see spropInit()
 OPTBLD_INLINE void iopEmptyS(IOP_ARGS) {
+  AS_ISSET;
   pc++;
   SpropState ss;
   spropInit(ss);
@@ -4958,33 +8759,107 @@ OPTBLD_INLINE void iopEmptyS(IOP_ARGS) {
   spropFinish(ss);
 }
 
+// Supported, see isSetEmptyM()
 OPTBLD_INLINE void iopEmptyM(IOP_ARGS) {
+  AS_MEMBER;
   isSetEmptyM<true>(pc);
 }
 
+// curtis:
 OPTBLD_INLINE void iopAKExists(IOP_ARGS) {
   pc++;
   TypedValue* arr = vmStack().topTV();
   TypedValue* key = arr + 1;
-  bool result = HHVM_FN(array_key_exists)(tvAsCVarRef(key), tvAsCVarRef(arr));
-  vmStack().popTV();
-  vmStack().replaceTV<KindOfBoolean>(result);
+
+  if (UNLIKELY(arr->m_type == KindOfMulti)) {
+    START;
+    AS_MISSET;
+    if (UNLIKELY(key->m_type == KindOfMulti)) {
+      // Arr and key are multi
+      TypedValue ret = MultiVal::makeMultiVal();
+      auto ret_multi = ret.m_data.pmulti;
+      auto key_multi = key->m_data.pmulti;
+      auto arr_multi = arr->m_data.pmulti;
+#ifdef CHENG_CHECK
+      cheng_assert(key_multi->valSize() == arr_multi->valSize());
+#endif
+      for (int i = 0; i < key_multi->valSize(); i++) {
+        TypedValue *cKey = key_multi->getByVal(i);
+        TypedValue *cArr = arr_multi->getByVal(i);
+        bool result = HHVM_FN(array_key_exists)(tvAsCVarRef(cKey), tvAsCVarRef(cArr));
+        Variant tmp(result);
+        TypedValue *tmp_result = tmp.asTypedValue();
+        ret_multi->addValue(*tmp_result);
+      }
+      vmStack().popTV();
+      tvCopy(ret, *key);
+    } else {
+      // Arr is multi, key is non-multi
+      auto multi = arr->m_data.pmulti;
+      TypedValue ret = MultiVal::makeMultiVal();
+      auto ret_multi = ret.m_data.pmulti;
+      for (int i = 0; i < multi->valSize(); i++) {
+         TypedValue *c = multi->getByVal(i);
+         bool result = HHVM_FN(array_key_exists)(tvAsCVarRef(key), tvAsCVarRef(c));
+         Variant tmp(result);
+         TypedValue *tmp_result = tmp.asTypedValue();
+         ret_multi->addValue(*tmp_result);
+      }
+      vmStack().popTV();
+      tvCopy(ret, *key);
+    }
+    END;
+  } else {
+    if (UNLIKELY(key->m_type == KindOfMulti)) {
+      START;
+      AS_MISSET;
+      // Arr is non-multi, key is multi
+      auto multi = key->m_data.pmulti;
+      TypedValue ret = MultiVal::makeMultiVal();
+      auto ret_multi = ret.m_data.pmulti;
+      for (int i = 0; i < multi->valSize(); i++) {
+        TypedValue *c = multi->getByVal(i);
+        bool result = HHVM_FN(array_key_exists)(tvAsCVarRef(c), tvAsCVarRef(arr));
+        Variant tmp(result);
+        TypedValue *tmp_result = tmp.asTypedValue();
+        ret_multi->addValue(*tmp_result);
+      }
+      vmStack().popTV();
+      tvCopy(ret, *key);
+      END;
+    } else {
+      // Arr and key are non-multi
+      bool result = HHVM_FN(array_key_exists)(tvAsCVarRef(key), tvAsCVarRef(arr));
+      vmStack().popTV();
+      vmStack().replaceTV<KindOfBoolean>(result);
+    }
+  }
 }
 
+// Not Impl
 OPTBLD_INLINE void iopGetMemoKey(IOP_ARGS) {
   pc++;
   auto obj = vmStack().topTV();
+#ifdef CHENG_CHECK
+  cheng_assert(obj->m_type != KindOfMulti);
+#endif
   auto var = HHVM_FN(serialize_memoize_param)(tvAsCVarRef(obj));
   auto res = var.asTypedValue();
   tvRefcountedIncRef(res);
   vmStack().replaceTV(*res);
 }
 
+// Not Impl
 OPTBLD_INLINE void iopIdx(IOP_ARGS) {
   pc++;
   TypedValue* def = vmStack().topTV();
   TypedValue* key = vmStack().indTV(1);
   TypedValue* arr = vmStack().indTV(2);
+#ifdef CHENG_CHECK
+  cheng_assert(def->m_type != KindOfMulti);
+  cheng_assert(key->m_type != KindOfMulti);
+  cheng_assert(arr->m_type != KindOfMulti);
+#endif
 
   TypedValue result = jit::genericIdx(*arr, *key, *def);
   vmStack().popTV();
@@ -4993,11 +8868,17 @@ OPTBLD_INLINE void iopIdx(IOP_ARGS) {
   *arr = result;
 }
 
+// Not Impl
 OPTBLD_INLINE void iopArrayIdx(IOP_ARGS) {
   pc++;
   TypedValue* def = vmStack().topTV();
   TypedValue* key = vmStack().indTV(1);
   TypedValue* arr = vmStack().indTV(2);
+#ifdef CHENG_CHECK
+  cheng_assert(def->m_type != KindOfMulti);
+  cheng_assert(key->m_type != KindOfMulti);
+  cheng_assert(arr->m_type != KindOfMulti);
+#endif
 
   Variant result = HHVM_FN(hphp_array_idx)(tvAsCVarRef(arr),
                                   tvAsCVarRef(key),
@@ -5007,48 +8888,220 @@ OPTBLD_INLINE void iopArrayIdx(IOP_ARGS) {
   tvAsVariant(arr) = result;
 }
 
+/* cheng-hack:
+ * $fr -> $to
+ * No matter $fr/$to is a multiVal or multiRef, we will follow the link.
+ *
+ * NOTE: the $to MUST be a stand-alone varible, a variable which either
+ * is local variable or global variable. Cannot be a element in either array
+ * or object.
+ */
+static inline void
+tvSetHelper(const Cell fr, TypedValue& inTo) {
+  assert(cellIsPlausible(fr));
+#ifdef CHENG_CHECK
+    // the fr cannot be multi-ref
+    cheng_assert(!(fr.m_type == KindOfMulti && fr.m_data.pmulti->getType() == KindOfRef));
+    cheng_assert(fr.m_type != KindOfRef);
+#endif
+  Cell* to = tvToCell(&inTo);
+
+  // if "to" is multi-Ref, it need sepcial care
+  if (UNLIKELY(to->m_type == KindOfMulti && to->m_data.pmulti->getType() == KindOfRef)) {
+    START;
+    AS_MSET;
+    // If we have (M, M):
+    if (fr.m_type == KindOfMulti) {
+      // if this is add_multi(), we will skip
+      if (to->m_data.num != fr.m_data.num) {
+#ifdef CHENG_INS_DEBUG
+    debug_log << "  SetX: \"to\" is multi-ref, as :\n" << to->m_data.pmulti->dump("    ");
+    debug_log << "  SetX: \"from\" is multi-val, as :\n" << fr.m_data.pmulti->dump("    ");
+#endif
+#ifdef CHENG_CHECK
+        cheng_assert(fr.m_data.pmulti->valSize() == to->m_data.pmulti->valSize());
+#endif
+        for (int i = 0; i < fr.m_data.pmulti->valSize(); i++) {
+          Cell *tmp_fr = fr.m_data.pmulti->getByVal(i);
+          Cell *tmp_to = to->m_data.pmulti->getByVal(i);
+          // tvSet will follow the link
+          tvSet(*tmp_fr, *tmp_to);
+        }
+      } else {
+        // do nothing, this might be add_multi
+      }
+    } else {
+#ifdef CHENG_INS_DEBUG
+      debug_log << "  SetX: \"to\" is multi-ref, as :\n" << to->m_data.pmulti->dump("    ");
+      debug_log << "  SetX: \"fr\" is single value, as : {{" << fr.pretty() << "}}\n";
+#endif
+      // we have (fr, to) = (S, M):
+      // FIXME: Not Supported! what if the into is a container-related value??
+      cheng_assert(to->m_type != KindOfArray && to->m_type != KindOfObject);
+      for (auto it : *to->m_data.pmulti) { tvSet(fr, *it); }
+    }
+    END;
+  } else {
+    tvSet(fr, inTo);
+  }
+  // cheng-hack: interesting old days, keep as a history mark.
+  //      // $single-ref = $multi-val
+  //      // change the fr to multi-ref
+  //      // assign to all the $single-ref
+  //      TypedValue multi_ref = MultiVal::cloneMultiVal(fr);
+  //      auto orig_ref = inTo.m_data.pref;
+  //      tvBoxMulti(&multi_ref);
+  //      auto f = [multi_ref, orig_ref] (TypedValue* tv) {
+  //        if (tv->m_type == KindOfRef &&
+  //            tv->m_data.pref == orig_ref) {
+  //#ifdef CHENG_INS_DEBUG
+  //          debug_log << "    replace ref {" << tv->pretty() << "} at location "
+  //            << tv << " into multi-ref\n";
+  //#endif
+  //          tvRefcountedDecRef(tv);
+  //          tvDup(multi_ref, *tv); 
+  //        }
+  //      };
+  //      // FIXME: there are three more: class static/array/object
+  //      iterGlobalVar(f);
+  //      iterLocalVar(f);
+}
+
+
+// Support, for performance, expand tvSetHelper() within
 OPTBLD_INLINE void iopSetL(IOP_ARGS) {
+  AS_SET;
   pc++;
   auto local = decode_la(pc);
   assert(local < vmfp()->m_func->numLocals());
   Cell* fr = vmStack().topC();
-  TypedValue* to = frame_local(vmfp(), local);
-  tvSet(*fr, *to);
+  TypedValue* into = frame_local(vmfp(), local);
+  // cheng-hack: used to be tvSet(*fr, *to);
+  //  Now, check out "fr" and "to" to see if multi-ref exists
+  Cell* to = tvToCell(into);
+  // if "to" is multi-Ref, it need sepcial care
+  if (UNLIKELY(to->m_type == KindOfMulti && to->m_data.pmulti->getType() == KindOfRef)) {
+    START;
+    AS_MSET;
+#ifdef CHENG_INS_ONLY_DEBUG
+    if (should_count) debug_log << "    meet multi-ref\n";
+#endif
+    // If we have (M, M):
+    if (fr->m_type == KindOfMulti) {
+#ifdef CHENG_INS_ONLY_DEBUG
+      if (should_count) debug_log << "    fr is also multi\n";
+#endif
+      // if this is add_multi(), we will skip
+      if (to->m_data.num != fr->m_data.num) {
+        for (int i = 0; i < fr->m_data.pmulti->valSize(); i++) {
+          Cell *tmp_fr = fr->m_data.pmulti->getByVal(i);
+          Cell *tmp_to = to->m_data.pmulti->getByVal(i);
+          // tvSet will follow the link
+          tvSet(*tmp_fr, *tmp_to);
+        }
+      } else {
+        // do nothing, this might be add_multi
+      }
+    } else {
+#ifdef CHENG_INS_ONLY_DEBUG
+      if (should_count) debug_log << "    fr is not multi\n"; 
+#endif
+      // we have (fr, to) = (S, M):
+      // FIXME: Not Supported! what if the into is a container-related value??
+      cheng_assert(to->m_type != KindOfArray && to->m_type != KindOfObject);
+      for (auto it : *to->m_data.pmulti) { tvSet(*fr, *it); }
+    }
+    END;
+  } else {
+    // normal case 
+    // tvSet(*fr, *to);
+    // cheng-hack: since we've called tvToCell for "to",
+    // expand the tvSet(...) below to save several cycles
+    assert(cellIsPlausible(fr));
+    //Cell* to = tvToCell(&inTo); <--- save this line
+    auto const oldType = to->m_type;
+    auto const oldDatum = to->m_data.num;
+    cellDup(*fr, *to);
+    tvRefcountedDecRefHelper(oldType, oldDatum);
+  }
 }
 
+// Support, see tvSetHelper()
 OPTBLD_INLINE void iopSetN(IOP_ARGS) {
+  AS_SET;
   pc++;
   StringData* name;
   Cell* fr = vmStack().topC();
   TypedValue* tv2 = vmStack().indTV(1);
+#ifdef CHENG_CHECK
+  cheng_assert(tv2->m_type != KindOfMulti);
+#endif
   TypedValue* to = nullptr;
   lookupd_var(vmfp(), name, tv2, to);
   assert(to != nullptr);
-  tvSet(*fr, *to);
+  tvSetHelper(*fr, *to);
   memcpy((void*)tv2, (void*)fr, sizeof(TypedValue));
   vmStack().discard();
   decRefStr(name);
 }
 
+// Support, see tvSetHelper()
 OPTBLD_INLINE void iopSetG(IOP_ARGS) {
+  AS_SET;
   pc++;
   StringData* name;
   Cell* fr = vmStack().topC();
   TypedValue* tv2 = vmStack().indTV(1);
+#ifdef CHENG_CHECK
+  cheng_assert(tv2->m_type != KindOfMulti);
+#endif
   TypedValue* to = nullptr;
   lookupd_gbl(vmfp(), name, tv2, to);
   assert(to != nullptr);
-  tvSet(*fr, *to);
+
+  // cheng-hack: tmp, assert false for a second
+  cheng_assert(!single_mode_on);
+  // cheng-hack: when in single_mode, expand the global variables.
+  if (single_mode_on) {
+    if (to->m_type != KindOfMulti) {
+      auto multiv = MultiVal::makeMultiVal();
+      for (int i=0; i<single_mode_size; i++) {
+        multiv.m_data.pmulti->addValue(*to);
+      }
+      // dec ref to original var
+      tvRefcountedDecRef(to);
+      // copy the multi to its place
+      tvCopy(multiv, *to);
+    }
+
+    tvSetHelper(*fr, *(to->m_data.pmulti->getByVal(single_mode_cur_iter)));
+    memcpy((void*)tv2, (void*)fr, sizeof(TypedValue));
+    vmStack().discard();
+    decRefStr(name);
+  } else {
+    // normal case
+  tvSetHelper(*fr, *to);
   memcpy((void*)tv2, (void*)fr, sizeof(TypedValue));
   vmStack().discard();
   decRefStr(name);
+  }
 }
 
+// Partly not Impl
+// Supported in tvSetHelper(...)
 OPTBLD_INLINE void iopSetS(IOP_ARGS) {
+  AS_SET;
   pc++;
   TypedValue* tv1 = vmStack().topTV();
   TypedValue* classref = vmStack().indTV(1);
   TypedValue* propn = vmStack().indTV(2);
+
+  // cheng-hack:
+#ifdef CHENG_CHECK
+  cheng_assert(classref->m_type != KindOfMulti);
+  cheng_assert(propn->m_type != KindOfMulti);
+#endif
+
   TypedValue* output = propn;
   StringData* name;
   TypedValue* val;
@@ -5059,55 +9112,250 @@ OPTBLD_INLINE void iopSetS(IOP_ARGS) {
                 classref->m_data.pcls->name()->data(),
                 name->data());
   }
-  tvSet(*tv1, *val);
+  tvSetHelper(*tv1, *val); // supported inside
   tvRefcountedDecRef(propn);
   memcpy(output, tv1, sizeof(TypedValue));
   vmStack().ndiscard(2);
   decRefStr(name);
 }
 
+// support:
+//   base is multi 
+//   value is multi
+//   index is multi
 OPTBLD_INLINE void iopSetM(IOP_ARGS) {
+  AS_MEMBER;
+  PC old_pc = pc;
+#ifdef CHENG_COUNT_INS
+  nested_ins_level_inc();
+#endif
+setm_start:
   pc++;
   MemberState mstate;
+  mstate.isMultiBase = false;
+  mstate.isVGetM = false;
   if (!setHelperPre<false, true, false, false, 1,
       VectorLeaveCode::LeaveLast>(pc, mstate)) {
-    Cell* c1 = vmStack().topC();
-    switch (mstate.mcode) {
+    Cell* c1 = vmStack().topC(); // this is the value we should assign
+
+    // cheng-hack: mstate.base_list is a pointer to a vector
+    // which contains the slots should be set in the following snippet.
+    int multi_num = 0;
+    bool multi_base = false, multi_value = false, multi_curMember = false;
+
+    if (UNLIKELY(mstate.isMultiBase)) {
+      multi_num = mstate.base_list->size();
+      multi_base = true;
+    }
+    if (UNLIKELY(c1->m_type == KindOfMulti)) {
+      multi_num = c1->m_data.pmulti->valSize();
+      multi_value = true;
+    }
+    // Used to be a BUG: if the mstate.mcode is MW, curMember might be nullptr
+    if (UNLIKELY(mstate.mcode != MW && mstate.curMember->m_type == KindOfMulti)) {
+      multi_num = mstate.curMember->m_data.pmulti->valSize();
+      multi_curMember = true;
+    }
+
+    // NOTE: we should open a hole for the system array here
+    // like: $_SERVER["abc"] = $multi
+    // but not for: $_SERVER['multi']['innner'] = 10
+    if (UNLIKELY(isSystemArr(mstate.orig_base) && !multi_base)) {
+#ifdef CHENG_INS_ONLY_DEBUG
+      debug_log << "    SetM, trying to set the system array.\n";
+#endif
+#ifdef CHENG_CHECK
+      cheng_assert(!multi_curMember);
+#endif
+      multi_value = false;
+    }
+
+    // If the base is single, but the index/value is multi, we need to split
+    // Only for array, not for object
+    if (UNLIKELY(!multi_base && (multi_value || multi_curMember) 
+                 && mstate.orig_base->m_type == KindOfArray)) {
+#ifdef CHENG_INS_ONLY_DEBUG
+      debug_log << "    Have to split the single-base...\n";
+#endif
+      // (S, M)
+      TypedValue *orig_base = mstate.orig_base;
+      TypedValue split_multi = MultiVal::splitArray(*orig_base, multi_num);
+      tvCopy(split_multi, *mstate.orig_base);
+      pc = old_pc;
+      goto setm_start;
+    }
+
+    // used to be a BUG: $obj->ref->array[$multi_indx] = $multi_val;
+    // solution: deref first
+    if (!multi_base) {
+      mstate.base = tvToCell(mstate.base);
+    }
+
+    // For obj-array-set-multi problem:
+    // e.g. $obj->arr[] = $multi;
+    if (UNLIKELY(!multi_base && (multi_curMember || multi_value) &&
+                 mstate.base->m_type == KindOfArray)) {
+#ifdef CHENG_INS_ONLY_DEBUG
+      debug_log << "   Split the last level array...\n";
+#endif
+      // we met a last level array which need to be splited
+      auto arr = mstate.base;
+
+      TypedValue split_multi = MultiVal::splitArray(*arr, multi_num);
+      tvCopy(split_multi, *arr); // copy back to original place
+      multi_base = true;
+      // construct base_list
+      mstate.base_list = std::make_shared< std::vector<TypedValue*> >();
+      for (auto arr_it : *split_multi.m_data.pmulti) {
+        mstate.base_list->push_back(arr_it);
+      }
+    }
+
+    // For multi-ref-one-obj problem:
+    // memberHelperPre might return multi_base with refs pointing to one obj.
+    // The ref will deref later within the set function.
+    // However, we need to detect this ahead
+    if (UNLIKELY(multi_base && (*mstate.base_list)[0]->m_type == KindOfRef)
+        && !checkStaticEmptyArray((*mstate.base_list)[0])) {
+      // check whether all refs point to one slot
+      Cell* first_elem = tvToCell((*mstate.base_list)[0]);
+      bool point_to_same_slot = true;
+      for (int i=1; i<mstate.base_list->size(); i++) {
+        if (first_elem->m_data.num !=
+            tvToCell((*mstate.base_list)[i])->m_data.num)
+        {
+          point_to_same_slot = false;
+          break;
+        }
+      }
+      // if point to the same slot, do it once
+      if (point_to_same_slot) {
+        multi_base = false;
+        // we deref here. Is it OK? seems so.
+        mstate.base = first_elem;
+      }
+    }
+
+    // If multi_base, do the set seperately
+    // If not, but has
+    //  -- multi_curMember: we do not support this yet (should to split)
+    //  -- multi_value: do as normal 
+    //       e.g. $multi_array[$s_obj]->val = $multival;
+    //       e.g. $multi_ref_to_one_obj->val = $multival;
+    if (UNLIKELY(multi_base)) {
+      TypedValue* base = mstate.base;
+      TypedValue* value = c1;
+      TypedValue* curMember = mstate.curMember;
+
+#ifdef CHENG_CHECK
+      if(multi_base) cheng_assert(mstate.base_list->size() == multi_num);
+      if(multi_value) cheng_assert(c1->m_data.pmulti->valSize() == multi_num);
+      if(multi_curMember) cheng_assert(mstate.curMember->m_data.pmulti->valSize() == multi_num);
+#endif
+
+#ifdef CHENG_INS_DEBUG
+      debug_log << "    SetM [" << multi_num <<"]  is_base:" << multi_base 
+        << ", is_value: " << multi_value << ", is_member:" << multi_curMember << "\n";
+      auto base_txt = HHVM_FN(print_r)(tvAsVariant(base), true);
+      auto value_txt = HHVM_FN(print_r)(tvAsVariant(value), true);
+      debug_log << "        cur_base: " << base->pretty() << " base content: "<< 
+        base_txt.toString().toCppString() << ", cur_value:"
+        << value_txt.toString().toCppString() << "\n"; 
+#endif
+
+      switch (mstate.mcode) {
       case MW:
-        SetNewElem<true>(mstate.base, c1);
+        for (int i = 0; i < multi_num; i++) {
+          if (multi_base) base = (*mstate.base_list)[i];
+          if (multi_value) value = c1->m_data.pmulti->getByVal(i); 
+          // normal behavior 
+          SetNewElem<true>(base, value);
+        }
         break;
       case MEL:
       case MEC:
       case MET:
       case MEI: {
-        StringData* result = SetElem<true>(mstate.base, *mstate.curMember, c1);
-        if (result) {
-          tvRefcountedDecRef(c1);
-          c1->m_type = KindOfString;
-          c1->m_data.pstr = result;
-        }
-        break;
-      }
+                  for (int i = 0; i < multi_num; i++) {
+                    if (multi_base) base = (*mstate.base_list)[i];
+                    if (multi_value) value = c1->m_data.pmulti->getByVal(i); 
+                    if (multi_curMember) curMember = mstate.curMember->m_data.pmulti->getByVal(i);
+
+                    StringData* result = SetElem<true>(base, *curMember, value);
+                    if (result) {
+                      tvRefcountedDecRef(value);
+                      value->m_type = KindOfString;
+                      value->m_data.pstr = result;
+                    }
+                  }
+                  break;
+                }
       case MPL:
       case MPC:
       case MPT: {
-        Class* ctx = arGetContextClass(vmfp());
-        SetProp<true>(ctx, mstate.base, *mstate.curMember, c1);
-        break;
-      }
+                  for (int i = 0; i < multi_num; i++) {
+                    if (multi_base) base = (*mstate.base_list)[i];
+                    if (multi_value) value = c1->m_data.pmulti->getByVal(i); 
+                    if (multi_curMember) curMember = mstate.curMember->m_data.pmulti->getByVal(i);
+
+                    Class* ctx = arGetContextClass(vmfp());
+                    // cheng: base can be reference, it will deref below
+                    SetProp<true>(ctx, base, *curMember, value);
+                  }
+                  break;
+                }
       case InvalidMemberCode:
-        assert(false);
-        break;
-    }
+                assert(false);
+                break;
+      }
+    } else {
+      // Do not support single_base but multi_curMember
+      cheng_assert(!multi_curMember);
+    // original
+    switch (mstate.mcode) {
+        case MW:
+          SetNewElem<true>(mstate.base, c1);
+          break;
+        case MEL:
+        case MEC:
+        case MET:
+        case MEI: {
+          StringData* result = SetElem<true>(mstate.base, *mstate.curMember, c1);
+          if (result) {
+            tvRefcountedDecRef(c1);
+            c1->m_type = KindOfString;
+            c1->m_data.pstr = result;
+          }
+          break;
+        }
+        case MPL:
+        case MPC:
+        case MPT: {
+          Class* ctx = arGetContextClass(vmfp());
+          SetProp<true>(ctx, mstate.base, *mstate.curMember, c1);
+          break;
+        }
+        case InvalidMemberCode:
+          assert(false); break;
+      }
+  }
   }
   setHelperPost<1>(mstate.ndiscard);
+#ifdef CHENG_COUNT_INS
+  nested_ins_level_dec();
+#endif
 }
 
+// Not Impl
 OPTBLD_INLINE void iopSetWithRefLM(IOP_ARGS) {
   pc++;
   MemberState mstate;
+  // cheng-hack: TODO not impl yet
+  mstate.isMultiBase = false;
+  mstate.isVGetM = false;
   bool skip = setHelperPre<false, true, false, false, 0,
                        VectorLeaveCode::ConsumeAll>(pc, mstate);
+  cheng_assert(mstate.isMultiBase == false); // cheng-hack
   auto local = decode_la(pc);
   if (!skip) {
     TypedValue* from = frame_local(vmfp(), local);
@@ -5116,11 +9364,16 @@ OPTBLD_INLINE void iopSetWithRefLM(IOP_ARGS) {
   setHelperPost<0>(mstate.ndiscard);
 }
 
+// Not Impl
 OPTBLD_INLINE void iopSetWithRefRM(IOP_ARGS) {
   pc++;
   MemberState mstate;
+  // cheng-hack: TODO not impl yet
+  mstate.isMultiBase = false;
+  mstate.isVGetM = false;
   bool skip = setHelperPre<false, true, false, false, 1,
                        VectorLeaveCode::ConsumeAll>(pc, mstate);
+  cheng_assert(mstate.isMultiBase == false); // cheng-hack
   if (!skip) {
     TypedValue* from = vmStack().top();
     tvAsVariant(mstate.base).setWithRef(tvAsVariant(from));
@@ -5129,27 +9382,105 @@ OPTBLD_INLINE void iopSetWithRefRM(IOP_ARGS) {
   vmStack().popTV();
 }
 
+// curtis:
 OPTBLD_INLINE void iopSetOpL(IOP_ARGS) {
+  AS_SET;
   pc++;
   auto local = decode_la(pc);
   auto op = decode_oa<SetOpOp>(pc);
   Cell* fr = vmStack().topC();
   Cell* to = tvToCell(frame_local(vmfp(), local));
-  SETOP_BODY_CELL(to, op, fr);
-  tvRefcountedDecRef(fr);
-  cellDup(*to, *fr);
+
+#ifdef CHENG_INS_DEBUG
+  auto txt_fr = HHVM_FN(print_r)(tvAsVariant(fr), true);
+  auto txt_to = HHVM_FN(print_r)(tvAsVariant(to), true);
+  debug_log << "    SetOpL from: {{" << txt_fr.toString().toCppString() << "}}\n"
+    << "      to: {{" << txt_to.toString().toCppString() << "}}\n";
+#endif
+
+  bool isFrMulti = (fr->m_type == KindOfMulti);
+  bool isToMulti = (to->m_type == KindOfMulti);
+  
+  // Used to be a BUG, since all the multi-value is call-by-ref,
+  // in one function "$multi += 1" may change the value outside the function scope
+  // do deep-copy before "+="
+  if (isToMulti) {
+    auto new_to = to->m_data.pmulti->copy();
+    tvCopy(new_to, *to);
+  }
+
+  if (UNLIKELY(isFrMulti || isToMulti)) {
+    START;
+    AS_MSET;
+    auto fr_multi = isFrMulti ? fr->m_data.pmulti: nullptr;
+    auto to_multi = isToMulti ? to->m_data.pmulti: nullptr;
+
+    if (isFrMulti && isToMulti) {
+      // (M, M)
+#ifdef CHENG_CHECK
+      cheng_assert(fr_multi->valSize() == to_multi->valSize());
+#endif
+      for (int i = 0; i < fr_multi->valSize(); i++) {
+        TypedValue *fr_c = fr_multi->getByVal(i);
+        TypedValue *to_c = to_multi->getByVal(i);
+        SETOP_BODY_CELL(to_c, op, fr_c);
+        tvRefcountedDecRef(fr_c);
+        cellDup(*to_c, *fr_c);
+      }
+
+    } else if (isFrMulti) {
+      // (S, M), $str .= $multi
+      TypedValue ret = MultiVal::makeMultiVal();
+      auto ret_multi = ret.m_data.pmulti;
+      for (int i = 0; i < fr_multi->valSize(); i++) {
+        TypedValue *fr_c = fr_multi->getByVal(i);
+        TypedValue to_c;
+        // Once a BUG: the TypedValue will be translated into Variant 
+        // which will decrease the ref when it is destructed, so use tvDup instead of tvCopy
+        tvDup(*to, to_c); 
+        SETOP_BODY_CELL(&to_c, op, fr_c);
+        ret_multi->addValue(to_c);
+      }
+      tvCopy(ret, *to);
+      tvRefcountedDecRef(fr);
+      cellDup(*to, *fr);
+    } else {
+      // (M, S), $multi .= $str
+      for (int i = 0; i < to_multi->valSize(); i++) {
+        TypedValue *to_c = to_multi->getByVal(i);
+        SETOP_BODY_CELL(to_c, op, fr);
+      }
+      tvRefcountedDecRef(fr);
+      cellDup(*to, *fr);
+    }
+    END;
+  } else {
+    // (S, S)
+    SETOP_BODY_CELL(to, op, fr);
+    tvRefcountedDecRef(fr);
+    cellDup(*to, *fr);
+  }
 }
 
+// Not Imple
 OPTBLD_INLINE void iopSetOpN(IOP_ARGS) {
+  AS_SET;
   pc++;
   auto op = decode_oa<SetOpOp>(pc);
   StringData* name;
   Cell* fr = vmStack().topC();
   TypedValue* tv2 = vmStack().indTV(1);
+#ifdef CHENG_CHECK
+  cheng_assert(fr->m_type != KindOfMulti);
+  cheng_assert(tv2->m_type != KindOfMulti);
+#endif
   TypedValue* to = nullptr;
   // XXX We're probably not getting warnings totally correct here
   lookupd_var(vmfp(), name, tv2, to);
   assert(to != nullptr);
+#ifdef CHENG_CHECK
+  cheng_assert(to->m_type != KindOfMulti);
+#endif
   SETOP_BODY(to, op, fr);
   tvRefcountedDecRef(fr);
   tvRefcountedDecRef(tv2);
@@ -5158,16 +9489,25 @@ OPTBLD_INLINE void iopSetOpN(IOP_ARGS) {
   decRefStr(name);
 }
 
+// Not Impl
 OPTBLD_INLINE void iopSetOpG(IOP_ARGS) {
+  AS_SET;
   pc++;
   auto op = decode_oa<SetOpOp>(pc);
   StringData* name;
   Cell* fr = vmStack().topC();
   TypedValue* tv2 = vmStack().indTV(1);
+#ifdef CHENG_CHECK
+  cheng_assert(fr->m_type != KindOfMulti);
+  cheng_assert(tv2->m_type != KindOfMulti);
+#endif
   TypedValue* to = nullptr;
   // XXX We're probably not getting warnings totally correct here
   lookupd_gbl(vmfp(), name, tv2, to);
   assert(to != nullptr);
+#ifdef CHENG_CHECK
+  cheng_assert(to->m_type != KindOfMulti);
+#endif
   SETOP_BODY(to, op, fr);
   tvRefcountedDecRef(fr);
   tvRefcountedDecRef(tv2);
@@ -5176,12 +9516,18 @@ OPTBLD_INLINE void iopSetOpG(IOP_ARGS) {
   decRefStr(name);
 }
 
+// cheng-hack: 
 OPTBLD_INLINE void iopSetOpS(IOP_ARGS) {
+  AS_SET;
   pc++;
   auto op = decode_oa<SetOpOp>(pc);
   Cell* fr = vmStack().topC();
   TypedValue* classref = vmStack().indTV(1);
   TypedValue* propn = vmStack().indTV(2);
+#ifdef CHENG_CHECK
+  always_assert(classref->m_type != KindOfMulti);
+  always_assert(propn->m_type != KindOfMulti);
+#endif
   TypedValue* output = propn;
   StringData* name;
   TypedValue* val;
@@ -5192,7 +9538,51 @@ OPTBLD_INLINE void iopSetOpS(IOP_ARGS) {
                 classref->m_data.pcls->name()->data(),
                 name->data());
   }
+  // cheng-hack:
+  if (UNLIKELY(val->m_type == KindOfMulti || fr->m_type == KindOfMulti)) {
+    START;
+    AS_MSET;
+    TypedValue multi_ret = MultiVal::makeMultiVal();
+    bool val_multi = val->m_type == KindOfMulti;
+    bool fr_multi = fr->m_type == KindOfMulti;
+    int times = val_multi ? val->m_data.pmulti->valSize() : fr->m_data.pmulti->valSize();
+
+#ifdef CHENG_INS_DEBUG
+    debug_log << "    val_multi: {" << val_multi << "}, fr_multi: {" << fr_multi << "}\n";
+    auto val_txt = HHVM_FN(print_r)(tvAsVariant(val), true);
+    auto fr_txt = HHVM_FN(print_r)(tvAsVariant(fr), true);
+    debug_log << "    val: {{ " << val_txt.toString().toCppString() << "}}\n"
+              << "    fr: {{ " << fr_txt.toString().toCppString() << "}}\n";
+#endif
+
+    for (int i = 0; i < times; i++) {
+      TypedValue tmp_val, tmp_fr;
+      if (val_multi) {
+        tvDup(*val->m_data.pmulti->getByVal(i), tmp_val);
+      } else {
+        tvDup(*val, tmp_val);
+      }
+      if (fr_multi) {
+        tvCopy(*fr->m_data.pmulti->getByVal(i), tmp_fr);
+      } else {
+        tvCopy(*fr, tmp_fr);
+      }
+      // Assumption: the following operation wll decref on tmp_val
+      SETOP_BODY(&tmp_val, op, &tmp_fr);
+      // collect the result
+#ifdef CHENG_INS_DEBUG
+      auto tmp_val_txt = HHVM_FN(print_r)(tvAsVariant(&tmp_val), true);
+      debug_log << "    round[" << i << "/" << times << "] result: " << tmp_val.pretty()
+        << "  {{" << tmp_val_txt.toString().toCppString() << "}}\n";
+#endif
+      multi_ret.m_data.pmulti->addValueNoInc(tmp_val); // no one will decref to tmp_val
+    }
+    tvRefcountedDecRef(val);
+    tvCopy(multi_ret, *val);
+    END;
+  } else {
   SETOP_BODY(val, op, fr);
+  }
   tvRefcountedDecRef(propn);
   tvRefcountedDecRef(fr);
   cellDup(*tvToCell(val), *output);
@@ -5200,33 +9590,197 @@ OPTBLD_INLINE void iopSetOpS(IOP_ARGS) {
   decRefStr(name);
 }
 
+// Support, same thing as SetM 
+// The base->index <op>= value:
+//  base  index  value
+//   T     -      -     do separately
+//   F     T      -     split the array, fail on the obj
+//   F     F      T     split the array, assign for the obj 
+//   F     F      F     normal
 OPTBLD_INLINE void iopSetOpM(IOP_ARGS) {
+  AS_MEMBER;
+  PC old_pc = pc;
+start:
   pc++;
   auto op = decode_oa<SetOpOp>(pc);
   MemberState mstate;
+  mstate.isMultiBase = false;
+  mstate.isVGetM = false;
   if (!setHelperPre<MoreWarnings, true, false, false, 1,
       VectorLeaveCode::LeaveLast>(pc, mstate)) {
+
+#ifdef CHENG_COUNT_INS
+  nested_ins_level_inc();
+#endif
+
     TypedValue* result;
     Cell* rhs = vmStack().topC();
 
+    // cheng-hack: prepare the tmp variables
+    TypedValue* base = mstate.base;
+    TypedValue* value = rhs;
+    TypedValue* curMember = mstate.curMember;
+    TypedValue multi_result;
+    int multi_num = 1;
+    bool multi_base = false, multi_value = false, multi_curMember = false;
+    if (UNLIKELY(mstate.isMultiBase)) {
+      multi_base = true;
+      multi_num = mstate.base_list->size();
+    }
+    if (UNLIKELY(rhs->m_type == KindOfMulti)) {
+      multi_value = true;
+      multi_num = rhs->m_data.pmulti->valSize();
+    }
+    if (UNLIKELY(mstate.mcode != MW && curMember->m_type == KindOfMulti)) {
+      multi_curMember = true;
+      multi_num = curMember->m_data.pmulti->valSize();
+    }
+    if (UNLIKELY(multi_base || multi_value || multi_curMember)) {
+      multi_result = MultiVal::makeMultiVal();
+    }
+
+#ifdef CHENG_CHECK
+    if(multi_base) cheng_assert(mstate.base_list->size() == multi_num);
+    if(multi_value) cheng_assert(rhs->m_data.pmulti->valSize() == multi_num);
+    if(multi_curMember) cheng_assert(mstate.curMember->m_data.pmulti->valSize() == multi_num);
+#endif
+
+    if (UNLIKELY(multi_base || multi_value || multi_curMember)) {START; AS_MMEMBER;}
+
+    // FIXME:NOTE: the below snippets are quite similar to SetM, should consider to merge.
+    // For the performance reason, leave it like this for now.
+
+    // If the base is single, but the index/value is multi, we need to split
+    // Only for array, not for object
+    if (UNLIKELY((multi_value || multi_curMember) && !multi_base && 
+                 mstate.orig_base->m_type == KindOfArray)) {
+      // (S, M)
+      TypedValue arr = *mstate.orig_base;
+      arr = MultiVal::splitArray(arr, multi_num);
+      tvCopy(arr, *mstate.orig_base);
+      pc = old_pc;
+#ifdef CHENG_INS_DEBUG
+      debug_log << "    SetOpM: Single base, and MultiVal: ";
+      if (multi_value) debug_log << "      Value: " << rhs->m_data.pmulti->dump("      ");
+      if (multi_curMember) {
+        //debug_log << "      " << mstate.curMember->pretty() << "\n";
+        debug_log << "      Index: " << mstate.curMember->m_data.pmulti->dump("      ");
+      }
+#endif
+      END;
+      goto start;
+    }
+
+    // For obj-array-set-multi problem:
+    // e.g. $obj->arr[0] .= $multi;
+    if (UNLIKELY((multi_curMember || multi_value) && !multi_base && 
+                 mstate.base->m_type == KindOfArray)) {
+#ifdef CHENG_INS_ONLY_DEBUG
+      debug_log << "   SetOpM: Split the last level array...\n";
+#endif
+      // we met a last level array which need to be splited
+      auto arr = mstate.base;
+
+      TypedValue split_multi = MultiVal::splitArray(*arr, multi_num);
+      tvCopy(split_multi, *arr); // copy back to original place
+      multi_base = true;
+      // construct base_list
+      mstate.base_list = std::make_shared< std::vector<TypedValue*> >();
+      for (auto arr_it : *split_multi.m_data.pmulti) {
+        mstate.base_list->push_back(arr_it);
+      }
+    }
+
+    // NOTE: if come here, means:
+    //  -- if orig_base/last_level container is array, has been split (multi_base==true)
+    //  -- if multi_curMember, must with multi_base
+    //  -- if multi_value ONLY, SetOpProp will handle the case
+    //  -- normal case: !multi_base && !multi_curMember && !multi_value
+
+    // For multi-ref-one-obj problem:
+    // memberHelperPre might return multi_base with refs pointing to one obj.
+    // The ref will deref later within the set function.
+    // However, we need to detect this ahead
+    if (UNLIKELY(multi_base && (*mstate.base_list)[0]->m_type == KindOfRef)
+        && !checkStaticEmptyArray((*mstate.base_list)[0])) {
+      // check whether all refs point to one slot
+      Cell* first_elem = tvToCell((*mstate.base_list)[0]);
+      bool point_to_same_slot = true;
+      for (int i=1; i<mstate.base_list->size(); i++) {
+        if (first_elem->m_data.num !=
+            tvToCell((*mstate.base_list)[i])->m_data.num)
+        {
+          point_to_same_slot = false;
+          break;
+        }
+      }
+      // if point to the same slot, do it once
+      if (point_to_same_slot) {
+        multi_base = false;
+        mstate.base = first_elem; // we deref here. Is it OK? seems so.
+        cheng_assert(!multi_curMember); // NOTE: do not support multi_curMember here
+      }
+    }
+
+    // FIXME: do not support single obj and multi_curMember
+    if (UNLIKELY(multi_curMember && !multi_base)) {
+      cheng_assert(false);
+    }
+
+    // The SetOpProp will handle multi_value, so if ONLY multi_value, we do not care
+    if (UNLIKELY(multi_value && !multi_base && !multi_curMember)) {
+      // only multi_value, !multi_base, !multi_curMember
+      // obj->index <op>= multi_value
+      // can be run directly which should handled by SetOpProp
+      multi_value = false;
+      multi_num = 1;
+#ifdef CHENG_INS_ONLY_DEBUG 
+      debug_log << "    SetOpM set multi_vale=false, and multi_num=1\n"; 
+#endif
+    }
+
+    for (int i = 0; i < multi_num; i++) {
+      if (multi_base) base = (*mstate.base_list)[i];
+      if (multi_curMember) curMember = mstate.curMember->m_data.pmulti->getByVal(i);
+      if (multi_value) {
+        value = rhs->m_data.pmulti->getByVal(i);
+        // Used to be a BUG: the ref_multi_array_array_pop_problem 
+        tvRefcountedIncRef(value);
+      } else {
+        // Used to be a BUG: the string might be freed after appending
+        tvRefcountedIncRef(value);
+      }
+
+#ifdef CHENG_INS_DEBUG
+      debug_log << "    SetOpM [" << i << "/" << multi_num <<"]  multi_base:" << multi_base 
+        << ", multi_value: " << multi_value << ", multi_member:" << multi_curMember << "\n";
+      auto base_txt = HHVM_FN(print_r)(tvAsVariant(base), true);
+      auto value_txt = HHVM_FN(print_r)(tvAsVariant(value), true);
+      debug_log << "        cur_base: " << base_txt.toString().toCppString() << ", cur_value:"
+        << value_txt.toString().toCppString() << "\n";
+#endif
+
+      // ASSUMPTION: NOTE: I assume the following will not use scratch/ref
     switch (mstate.mcode) {
       case MW:
         result = SetOpNewElem(mstate.scratch, *mstate.ref.asTypedValue(),
-                              op, mstate.base, rhs);
+                              op, base, value);
         break;
       case MEL:
       case MEC:
       case MET:
       case MEI:
         result = SetOpElem(mstate.scratch, *mstate.ref.asTypedValue(),
-                           op, mstate.base, *mstate.curMember, rhs);
+                           op, base, *curMember, value);
         break;
       case MPL:
       case MPC:
       case MPT: {
+                  // for object, it is possible that single-obj->multi_value += multi_value;
+                  // should be support in SetOpProp()
         Class *ctx = arGetContextClass(vmfp());
         result = SetOpProp(mstate.scratch, *mstate.ref.asTypedValue(),
-                           ctx, op, mstate.base, *mstate.curMember, rhs);
+                           ctx, op, base, *curMember, value);
         break;
       }
 
@@ -5236,13 +9790,31 @@ OPTBLD_INLINE void iopSetOpM(IOP_ARGS) {
         break;
     }
 
-    tvRefcountedDecRef(rhs);
-    cellDup(*tvToCell(result), *rhs);
+    tvRefcountedDecRef(value);
+    // cheng-hack: if this is multivalue, we should make the result multiVal
+    if (UNLIKELY(multi_base || multi_value || multi_curMember)) {
+      multi_result.m_data.pmulti->addValue(*tvToCell(result));
+    }
+    }
+
+    if (UNLIKELY(multi_base || multi_value || multi_curMember)) {
+      tvCopy(multi_result, *rhs);
+      END;
+    } else {
+      // normal case
+      cellDup(*tvToCell(result), *rhs);
+    }
+
+#ifdef CHENG_COUNT_INS
+    nested_ins_level_dec();
+#endif
   }
   setHelperPost<1>(mstate.ndiscard);
 }
 
+// Support
 OPTBLD_INLINE void iopIncDecL(IOP_ARGS) {
+  AS_SET;
   pc++;
   auto local = decode_la(pc);
   auto op = decode_oa<IncDecOp>(pc);
@@ -5255,34 +9827,102 @@ OPTBLD_INLINE void iopIncDecL(IOP_ARGS) {
   } else {
     fr = tvToCell(fr);
   }
-  IncDecBody<true>(op, fr, to);
+  if (UNLIKELY(fr->m_type == KindOfMulti)) {
+    START;
+    AS_MSET;
+    TypedValue multi_ret = MultiVal::makeMultiVal();
+    int size = fr->m_data.pmulti->valSize();
+    TypedValue tmp;
+    tvWriteUninit(&tmp);
+
+    for (int i=0; i<size; i++) {
+      IncDecBody<true>(op, fr->m_data.pmulti->getByVal(i), &tmp);
+      multi_ret.m_data.pmulti->addValue(tmp);
+    }
+
+    tvCopy(multi_ret, *to);
+    END;
+  } else {
+    // normal case
+    IncDecBody<true>(op, fr, to);
+  }
 }
 
+// Support
 OPTBLD_INLINE void iopIncDecN(IOP_ARGS) {
+  AS_SET;
   pc++;
   auto op = decode_oa<IncDecOp>(pc);
   StringData* name;
   TypedValue* nameCell = vmStack().topTV();
+#ifdef CHENG_CHECK
+  cheng_assert(nameCell->m_type != KindOfMulti);
+#endif
   TypedValue* local = nullptr;
   lookupd_var(vmfp(), name, nameCell, local);
   assert(local != nullptr);
-  IncDecBody<true>(op, tvToCell(local), nameCell);
+
+  if (UNLIKELY(tvToCell(local)->m_type == KindOfMulti)) {
+    START;
+    AS_MSET;
+    auto fr = tvToCell(local);
+    TypedValue multi_ret = MultiVal::makeMultiVal();
+    int size = fr->m_data.pmulti->valSize();
+    TypedValue tmp;
+    tvWriteUninit(&tmp);
+
+    for (int i=0; i<size; i++) {
+      IncDecBody<true>(op, fr->m_data.pmulti->getByVal(i), &tmp);
+      multi_ret.m_data.pmulti->addValue(tmp);
+    }
+
+    tvCopy(multi_ret, *nameCell);
+    END;
+  } else {
+    IncDecBody<true>(op, tvToCell(local), nameCell);
+  }
+
   decRefStr(name);
 }
 
+// Support
 OPTBLD_INLINE void iopIncDecG(IOP_ARGS) {
+  AS_SET;
   pc++;
   auto op = decode_oa<IncDecOp>(pc);
   StringData* name;
   TypedValue* nameCell = vmStack().topTV();
+#ifdef CHENG_CHECK
+  cheng_assert(nameCell->m_type != KindOfMulti);
+#endif
   TypedValue* gbl = nullptr;
   lookupd_gbl(vmfp(), name, nameCell, gbl);
   assert(gbl != nullptr);
-  IncDecBody<true>(op, tvToCell(gbl), nameCell);
+  if (UNLIKELY(tvToCell(gbl)->m_type == KindOfMulti)) {
+    START;
+    AS_MSET;
+    auto fr = tvToCell(gbl);
+    TypedValue multi_ret = MultiVal::makeMultiVal();
+    int size = fr->m_data.pmulti->valSize();
+    TypedValue tmp;
+    tvWriteUninit(&tmp);
+
+    for (int i=0; i<size; i++) {
+      IncDecBody<true>(op, fr->m_data.pmulti->getByVal(i), &tmp);
+      multi_ret.m_data.pmulti->addValue(tmp);
+    }
+
+    tvCopy(multi_ret, *nameCell);
+    END;
+  } else {
+    IncDecBody<true>(op, tvToCell(gbl), nameCell);
+  }
   decRefStr(name);
 }
 
+// Support by IncDecBody 
 OPTBLD_INLINE void iopIncDecS(IOP_ARGS) {
+  AS_SET;
   pc++;
   SpropState ss;
   spropInit(ss);
@@ -5293,87 +9933,220 @@ OPTBLD_INLINE void iopIncDecS(IOP_ARGS) {
                 ss.name->data());
   }
   tvRefcountedDecRef(ss.nameCell);
-  IncDecBody<true>(op, tvToCell(ss.val), ss.output);
+  if (UNLIKELY(tvToCell(ss.val)->m_type == KindOfMulti)) {
+    START;
+    AS_MSET;
+    auto fr = tvToCell(ss.val);
+    TypedValue multi_ret = MultiVal::makeMultiVal();
+    int size = fr->m_data.pmulti->valSize();
+    TypedValue tmp;
+    tvWriteUninit(&tmp);
+
+    for (int i=0; i<size; i++) {
+      IncDecBody<true>(op, fr->m_data.pmulti->getByVal(i), &tmp);
+      multi_ret.m_data.pmulti->addValue(tmp);
+    }
+
+    tvCopy(multi_ret, *ss.output);
+    END;
+  } else {
+    IncDecBody<true>(op, tvToCell(ss.val), ss.output);
+  }
   vmStack().discard();
   spropFinish(ss);
 }
 
+// Support
 OPTBLD_INLINE void iopIncDecM(IOP_ARGS) {
+  AS_MEMBER;
   pc++;
   auto op = decode_oa<IncDecOp>(pc);
   MemberState mstate;
+  TypedValue multi_result; bool is_multi = false; // cheng-hack 
   TypedValue to = make_tv<KindOfUninit>();
+  mstate.isMultiBase = false;
+  mstate.isVGetM = false;
   if (!setHelperPre<MoreWarnings, true, false, false, 0,
       VectorLeaveCode::LeaveLast>(pc, mstate)) {
+#ifdef CHENG_COUNT_INS
+    nested_ins_level_inc();
+#endif
+
+    // cheng-hack:
+    TypedValue *base = mstate.base;
+    TypedValue *curMember = mstate.curMember;
+    int multi_num = 1;
+    bool multi_base = false, multi_curMember = false;
+    if (UNLIKELY(mstate.isMultiBase)) {
+      multi_num = mstate.base_list->size();
+      multi_base = true;
+    }
+    if (UNLIKELY(mstate.mcode != MW && mstate.curMember->m_type == KindOfMulti)) {
+      multi_num = mstate.curMember->m_data.pmulti->valSize();
+      multi_curMember = true;
+    }
+    if (multi_base || multi_curMember) {
+      is_multi = true;
+      multi_result = MultiVal::makeMultiVal();
+    }
+
+#ifdef CHENG_CHECK
+    if(multi_base) cheng_assert(mstate.base_list->size() == multi_num);
+    if(multi_curMember) cheng_assert(mstate.curMember->m_data.pmulti->valSize() == multi_num);
+#endif
+
+    if (UNLIKELY(multi_base || multi_curMember)) {START; AS_MMEMBER;}
+
+    for (int i = 0; i < multi_num; i++) {
+      if (multi_base) base = (*mstate.base_list)[i];
+      if (multi_curMember) curMember = mstate.curMember->m_data.pmulti->getByVal(i);
+
     switch (mstate.mcode) {
       case MW:
-        IncDecNewElem<true>(*mstate.ref.asTypedValue(), op, mstate.base, to);
+        IncDecNewElem<true>(*mstate.ref.asTypedValue(), op, base, to);
         break;
       case MEL:
       case MEC:
       case MET:
       case MEI:
-        IncDecElem<true>(*mstate.ref.asTypedValue(), op, mstate.base,
-                         *mstate.curMember, to);
+        IncDecElem<true>(*mstate.ref.asTypedValue(), op, base,
+                         *curMember, to);
         break;
       case MPL:
       case MPC:
       case MPT: {
         Class* ctx = arGetContextClass(vmfp());
-        IncDecProp<true>(ctx, op, mstate.base, *mstate.curMember, to);
+        IncDecProp<true>(ctx, op, base, *curMember, to);
         break;
       }
       case InvalidMemberCode:
         assert(false);
         break;
     }
+    // cheng-hack: if multival, collect the result
+    if (UNLIKELY(multi_base || multi_curMember)) {
+      multi_result.m_data.pmulti->addValue(to);
+      END;
+    }
+    }
+
+#ifdef CHENG_COUNT_INS
+    nested_ins_level_dec();
+#endif
   }
   setHelperPost<0>(mstate.ndiscard);
   Cell* c1 = vmStack().allocC();
-  memcpy(c1, &to, sizeof(TypedValue));
+  // cheng-hack: push the correct result to stack
+  if (UNLIKELY(is_multi)) {
+    memcpy(c1, &multi_result, sizeof(TypedValue));
+  } else {
+    memcpy(c1, &to, sizeof(TypedValue));
+  }
 }
 
+// cheng-hack:
+static inline
+void tvBindMulti(const TypedValue* fr, TypedValue* to) {
+  if (UNLIKELY(fr->m_type == KindOfMulti)) {
+    START;
+    AS_MSET;
+    // if the fr is multi-value, it must be multi-ref!
+#ifdef CHENG_CHECK
+    cheng_assert(fr->m_data.pmulti->getType() == KindOfRef);
+#endif
+    /* NOTE(1): we have different behavior here compared with tvBind().
+     * For tvBind(), it will create a new Ref and increase the 
+     * target slot's counter.
+     * For us, we share the same multi-ref structure. In that case,
+     * no new Refs are created. So far, it seems OK. But not sure
+     * if this is a universal truth.
+     */
+#ifdef CHENG_INS_DEBUG
+    debug_log << "  Before BindX:\n    " << to->pretty() << "\n";
+#endif
+    DataType oldType = to->m_type;
+    uint64_t oldDatum = to->m_data.num;
+    tvCopy(*fr, *to);
+    tvRefcountedDecRefHelper(oldType, oldDatum);
+#ifdef CHENG_INS_DEBUG
+    debug_log << "  After BindX:\n" << to->m_data.pmulti->dump("    ");
+#endif
+    END;
+  } else {
+    tvBind(fr, to);
+  }
+}
+
+// Support by tvBindMulti()
 OPTBLD_INLINE void iopBindL(IOP_ARGS) {
+  AS_SET;
   pc++;
   auto local = decode_la(pc);
   Ref* fr = vmStack().topV();
   TypedValue* to = frame_local(vmfp(), local);
-  tvBind(fr, to);
+  // cheng-hack: used to be tvBind(...)
+  //tvBind(fr, to);
+  tvBindMulti(fr, to);
 }
 
+// Not Impl 
 OPTBLD_INLINE void iopBindN(IOP_ARGS) {
+  AS_SET;
   pc++;
   StringData* name;
   TypedValue* fr = vmStack().topTV();
   TypedValue* nameTV = vmStack().indTV(1);
+#ifdef CHENG_CHECK
+  cheng_assert(fr->m_type != KindOfMulti);
+  cheng_assert(nameTV->m_type != KindOfMulti);
+#endif
   TypedValue* to = nullptr;
   lookupd_var(vmfp(), name, nameTV, to);
   assert(to != nullptr);
+#ifdef CHENG_CHECK
+  cheng_assert(to->m_type != KindOfMulti);
+#endif
   tvBind(fr, to);
   memcpy((void*)nameTV, (void*)fr, sizeof(TypedValue));
   vmStack().discard();
   decRefStr(name);
 }
 
+// Not Impl
 OPTBLD_INLINE void iopBindG(IOP_ARGS) {
+  AS_SET;
   pc++;
   StringData* name;
   TypedValue* fr = vmStack().topTV();
   TypedValue* nameTV = vmStack().indTV(1);
+#ifdef CHENG_CHECK
+  cheng_assert(fr->m_type != KindOfMulti);
+  cheng_assert(nameTV->m_type != KindOfMulti);
+#endif
   TypedValue* to = nullptr;
   lookupd_gbl(vmfp(), name, nameTV, to);
   assert(to != nullptr);
+#ifdef CHENG_CHECK
+  cheng_assert(to->m_type != KindOfMulti);
+#endif
   tvBind(fr, to);
   memcpy((void*)nameTV, (void*)fr, sizeof(TypedValue));
   vmStack().discard();
   decRefStr(name);
 }
 
+// Not Impl
 OPTBLD_INLINE void iopBindS(IOP_ARGS) {
+  AS_SET;
   pc++;
   TypedValue* fr = vmStack().topTV();
   TypedValue* classref = vmStack().indTV(1);
   TypedValue* propn = vmStack().indTV(2);
+#ifdef CHENG_CHECK
+  cheng_assert(fr->m_type != KindOfMulti);
+  cheng_assert(classref->m_type != KindOfMulti);
+  cheng_assert(propn->m_type != KindOfMulti);
+#endif
   TypedValue* output = propn;
   StringData* name;
   TypedValue* val;
@@ -5391,31 +10164,108 @@ OPTBLD_INLINE void iopBindS(IOP_ARGS) {
   decRefStr(name);
 }
 
+// Not Impl, FIXME: it seems a tricky task:
+//      (1) What if you want bind a multi-ref to a single array's element?
+//      (2) What if one Ref bind to a multi array? all of the array share one ref? 
 OPTBLD_INLINE void iopBindM(IOP_ARGS) {
+  AS_MEMBER;
   pc++;
   MemberState mstate;
+  // cheng-hack: TODO not impl yet
+  // This is a little bit tricky.
+  mstate.isMultiBase = false;
+  mstate.isVGetM = false;
   TypedValue* tv1 = vmStack().topTV();
   if (!setHelperPre<false, true, false, true, 1,
       VectorLeaveCode::ConsumeAll>(pc, mstate)) {
+#ifdef CHENG_COUNT_INS
+    nested_ins_level_inc();
+#endif
     // Bind the element/property with the var on the top of the stack
-    tvBind(tv1, mstate.base);
+    // cheng-hack:
+    if (UNLIKELY(mstate.isMultiBase)) {
+      START;
+      AS_MMEMBER;
+      // multi-mulit, no fr(tv1) single; to(mstate.base_list) multi
+      // (1) bind $container-multi, $multi-ref
+      // (2) bind $container-multi, $ref-multi
+      // (3) bind $container-multi, $ref
+      if (tv1->m_type == KindOfMulti && tv1->m_data.pmulti->getType() == KindOfRef) {
+        cheng_assert(tv1->m_data.pmulti->valSize() == mstate.base_list->size());
+        for (int i=0; i<mstate.base_list->size(); i++) {
+          tvBind(tv1->m_data.pmulti->getByVal(i), (*mstate.base_list)[i]);
+        }
+      } else {
+        cheng_assert(tv1->m_type == KindOfRef);
+        auto fr = tvToCell(tv1);
+        if (fr->m_type == KindOfMulti) {
+          // case (2)
+          if (fr->m_data.pmulti->getType() != KindOfRef) {
+            cheng_assert(fr->m_data.pmulti->valSize() == mstate.base_list->size());
+            // make it a multi-ref
+            tvBoxMulti(fr);
+          } // else, fr is already a multi-ref
+          // assign to $container-multi
+          for (int i=0; i<mstate.base_list->size(); i++) {
+            tvBind(fr->m_data.pmulti->getByVal(i), (*mstate.base_list)[i]);
+          }
+        } else {
+          if (/*fr->m_type != KindOfObject &&*/ fr->m_type == KindOfArray) {
+            // if it is an array, split it to multi-ref and assign each ref to each element
+            int size = mstate.base_list->size();
+            auto ret = MultiVal::splitArray(*fr, size);
+            tvCopy(ret, *fr); // recover original array
+            // make a multi-ref
+            tvBoxMulti(fr);
+            for (int i=0; i<size; i++) {
+              auto ref = fr->m_data.pmulti->getByVal(i);
+              tvBind(ref, (*mstate.base_list)[i]);
+            }
+          } else {
+            // it's ok to assign primitive ref to a multi
+            // it's also ok to assign the obj to a multi, since obj has multivalue inside. 
+            for (int i=0; i<mstate.base_list->size(); i++) {
+              tvBind(tv1, (*mstate.base_list)[i]);
+            }
+          }
+        }
+      }
+      END;
+    } else {
+      // single, no fr(tv1) multi; to(mstate.base) single
+      // FIXME: do not support multi-ref/ref-multi bind to a single base
+      // KNOWN-BUG: no guarantee, what if I allow this?
+      //cheng_assert(tvToCell(tv1)->m_type != KindOfMulti); // cheng-hack
+      tvBind(tv1, mstate.base);
+    }
+#ifdef CHENG_COUNT_INS
+    nested_ins_level_dec();
+#endif
   }
   setHelperPost<1>(mstate.ndiscard);
 }
 
+// Good to go
 OPTBLD_INLINE void iopUnsetL(IOP_ARGS) {
+  AS_SET;
   pc++;
   auto local = decode_la(pc);
   assert(local < vmfp()->m_func->numLocals());
   TypedValue* tv = frame_local(vmfp(), local);
   tvRefcountedDecRef(tv);
+  // FIXME: should decref inside the multi-val here
   tvWriteUninit(tv);
 }
 
+// Good to go
 OPTBLD_INLINE void iopUnsetN(IOP_ARGS) {
+  AS_SET;
   pc++;
   StringData* name;
   TypedValue* tv1 = vmStack().topTV();
+#ifdef CHENG_CHECK
+  cheng_assert(tv1->m_type != KindOfMulti);
+#endif
   TypedValue* tv = nullptr;
   lookup_var(vmfp(), name, tv1, tv);
   assert(!vmfp()->hasInvName());
@@ -5427,9 +10277,14 @@ OPTBLD_INLINE void iopUnsetN(IOP_ARGS) {
   decRefStr(name);
 }
 
+// Good to go
 OPTBLD_INLINE void iopUnsetG(IOP_ARGS) {
+  AS_SET;
   pc++;
   TypedValue* tv1 = vmStack().topTV();
+#ifdef CHENG_CHECK
+  cheng_assert(tv1->m_type != KindOfMulti);
+#endif
   StringData* name = lookup_name(tv1);
   VarEnv* varEnv = g_context->m_globalVarEnv;
   assert(varEnv != nullptr);
@@ -5438,23 +10293,55 @@ OPTBLD_INLINE void iopUnsetG(IOP_ARGS) {
   decRefStr(name);
 }
 
+// Support
 OPTBLD_INLINE void iopUnsetM(IOP_ARGS) {
+  AS_MEMBER;
   pc++;
   MemberState mstate;
+  mstate.isMultiBase = false;
+  mstate.isVGetM = false;
   if (!setHelperPre<false, false, true, false, 0,
       VectorLeaveCode::LeaveLast>(pc, mstate)) {
+#ifdef CHENG_COUNT_INS
+    nested_ins_level_inc();
+#endif
+
+    // cheng-hack:
+    TypedValue *base = mstate.base;
+    TypedValue *curMember = mstate.curMember;
+    bool multi_base = false, multi_curMember = false;
+    int multi_num = 1;
+    if (UNLIKELY(mstate.isMultiBase)) {
+      multi_num = mstate.base_list->size();
+      multi_base = true;
+    }
+    if (UNLIKELY(mstate.mcode != MW && mstate.curMember->m_type == KindOfMulti)) {
+      multi_num = mstate.curMember->m_data.pmulti->valSize();
+      multi_curMember = true;
+    }
+
+#ifdef CHENG_CHECK
+    if(multi_base) cheng_assert(mstate.base_list->size() == multi_num);
+    if(multi_curMember) cheng_assert(mstate.curMember->m_data.pmulti->valSize() == multi_num);
+#endif
+
+    if (multi_num > 1) {START; AS_MMEMBER;}
+    for (int i = 0; i < multi_num; i++) {
+      if (multi_base) base = (*mstate.base_list)[i];
+      if (multi_curMember) curMember = mstate.curMember->m_data.pmulti->getByVal(i);
+
     switch (mstate.mcode) {
       case MEL:
       case MEC:
       case MET:
       case MEI:
-        UnsetElem(mstate.base, *mstate.curMember);
+        UnsetElem(base, *curMember);
         break;
       case MPL:
       case MPC:
       case MPT: {
         Class* ctx = arGetContextClass(vmfp());
-        UnsetProp(ctx, mstate.base, *mstate.curMember);
+        UnsetProp(ctx, base, *curMember);
         break;
       }
       case MW:
@@ -5462,6 +10349,12 @@ OPTBLD_INLINE void iopUnsetM(IOP_ARGS) {
         assert(false);
         break;
     }
+    }
+    if (multi_num > 1) END;
+
+#ifdef CHENG_COUNT_INS
+    nested_ins_level_dec();
+#endif
   }
   setHelperPost<0>(mstate.ndiscard);
 }
@@ -5475,7 +10368,9 @@ OPTBLD_INLINE ActRec* fPushFuncImpl(const Func* func, int numArgs) {
   return ar;
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPushFunc(IOP_ARGS) {
+  AS_CALL;
   pc++;
   auto numArgs = decode_iva(pc);
   Cell* c1 = vmStack().topC();
@@ -5483,6 +10378,9 @@ OPTBLD_INLINE void iopFPushFunc(IOP_ARGS) {
 
   // Throughout this function, we save obj/string/array and defer
   // refcounting them until after the stack has been discarded.
+
+  // cheng-hack: may see the multi-lambda, do not support, just fail
+  cheng_assert(c1->m_type != KindOfMulti);
 
   if (IS_STRING_TYPE(c1->m_type)) {
     StringData* origSd = c1->m_data.pstr;
@@ -5493,7 +10391,7 @@ OPTBLD_INLINE void iopFPushFunc(IOP_ARGS) {
 
     vmStack().discard();
     ActRec* ar = fPushFuncImpl(func, numArgs);
-    ar->setThis(nullptr);
+    ar->setThisSingle(nullptr);
     decRefStr(origSd);
     return;
   }
@@ -5514,7 +10412,7 @@ OPTBLD_INLINE void iopFPushFunc(IOP_ARGS) {
       ar->setClass(origObj->getVMClass());
       decRefObj(origObj);
     } else {
-      ar->setThis(origObj);
+      ar->setThisSingle(origObj);
       // Teleport the reference from the destroyed stack cell to the
       // ActRec. Don't try this at home.
     }
@@ -5547,7 +10445,7 @@ OPTBLD_INLINE void iopFPushFunc(IOP_ARGS) {
     ActRec* ar = fPushFuncImpl(func, numArgs);
     if (arrThis) {
       arrThis->incRefCount();
-      ar->setThis(arrThis);
+      ar->setThisSingle(arrThis);
     } else {
       ar->setClass(arrCls);
     }
@@ -5561,7 +10459,9 @@ OPTBLD_INLINE void iopFPushFunc(IOP_ARGS) {
   raise_error(Strings::FUNCTION_NAME_MUST_BE_STRING);
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPushFuncD(IOP_ARGS) {
+  AS_CALL;
   pc++;
   auto numArgs = decode_iva(pc);
   auto id = decode<Id>(pc);
@@ -5573,10 +10473,12 @@ OPTBLD_INLINE void iopFPushFuncD(IOP_ARGS) {
                 vmfp()->m_func->unit()->lookupLitstrId(id)->data());
   }
   ActRec* ar = fPushFuncImpl(func, numArgs);
-  ar->setThis(nullptr);
+  ar->setThisSingle(nullptr);
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPushFuncU(IOP_ARGS) {
+  AS_CALL;
   pc++;
   auto numArgs = decode_iva(pc);
   auto nsFunc = decode<Id>(pc);
@@ -5593,11 +10495,14 @@ OPTBLD_INLINE void iopFPushFuncU(IOP_ARGS) {
     }
   }
   ActRec* ar = fPushFuncImpl(func, numArgs);
-  ar->setThis(nullptr);
+  ar->setThisSingle(nullptr);
 }
 
+// cheng-hack: 
+// used by FPushObjMethod/FPushObjMethodD
 void fPushObjMethodImpl(Class* cls, StringData* name, ObjectData* obj,
-                        int numArgs) {
+                        int numArgs,
+                        sptr< std::vector<ObjectData*> > multi_obj = nullptr) {
   const Func* f;
   LookupResult res = g_context->lookupObjMethod(f, cls, name,
                                          arGetContextClass(vmfp()), true);
@@ -5605,15 +10510,37 @@ void fPushObjMethodImpl(Class* cls, StringData* name, ObjectData* obj,
   ActRec* ar = vmStack().allocA();
   ar->m_func = f;
   if (res == LookupResult::MethodFoundNoThis) {
+    // cheng-hack: 
+    if (UNLIKELY(obj == nullptr)) {
+      // we are in multi mode
+      cheng_assert(multi_obj != nullptr);
+      for (auto it : *multi_obj) { decRefObj(it); }
+    } else {
+      // normal case
     decRefObj(obj);
+    }
     ar->setClass(cls);
   } else {
     assert(res == LookupResult::MethodFoundWithThis ||
            res == LookupResult::MagicCallFound);
     /* Transfer ownership of obj to the ActRec*/
-    ar->setThis(obj);
+    // cheng-hack: decide whether is multi-this mode
+    if (UNLIKELY(obj == nullptr)) {
+      ar->setThisMulti(multi_obj);
+    } else {
+      // normal case
+    ar->setThisSingle(obj);
+    }
   }
+  // chneg-hack:
+  // NOTE: take care here, the initNumArgs will flush the multiThis bit
+  // Here is the ONLY point, we push a multi-this ActRec!!
+  if (UNLIKELY(obj==nullptr)) {
+    ar->initNumArgsFromMultiThis(numArgs);
+  } else {
+    // normal case
   ar->initNumArgs(numArgs);
+  }
   if (res == LookupResult::MagicCallFound) {
     ar->setInvName(name);
   } else {
@@ -5626,7 +10553,7 @@ void fPushNullObjMethod(int numArgs) {
   assert(SystemLib::s_nullFunc);
   ActRec* ar = vmStack().allocA();
   ar->m_func = SystemLib::s_nullFunc;
-  ar->setThis(nullptr);
+  ar->setThisSingle(nullptr);
   ar->initNumArgs(numArgs);
   ar->setVarEnv(nullptr);
 }
@@ -5644,7 +10571,10 @@ static void throw_call_non_object(const char* methodName,
   throw FatalErrorException(msg.c_str());
 }
 
+// Support by fPushObjMethodImpl()
+//   Basically, we should check if this is multi-this
 OPTBLD_INLINE void iopFPushObjMethod(IOP_ARGS) {
+  AS_CALL;
   pc++;
   auto numArgs = decode_iva(pc);
   auto op = decode_oa<ObjMethodOp>(pc);
@@ -5653,7 +10583,11 @@ OPTBLD_INLINE void iopFPushObjMethod(IOP_ARGS) {
     raise_error(Strings::METHOD_NAME_MUST_BE_STRING);
   }
   Cell* c2 = vmStack().indC(1); // Object.
-  if (c2->m_type != KindOfObject) {
+
+  // cheng-hack:
+  // It doesn't make sense that method name is a multiVal
+  cheng_assert(c1->m_type != KindOfMulti);
+  if (UNLIKELY(c2->m_type != KindOfObject && c2->m_type != KindOfMulti)) {
     if (UNLIKELY(op == ObjMethodOp::NullThrows || !IS_NULL_TYPE(c2->m_type))) {
       throw_call_non_object(c1->m_data.pstr->data(),
                             getDataTypeString(c2->m_type).get()->data());
@@ -5663,21 +10597,65 @@ OPTBLD_INLINE void iopFPushObjMethod(IOP_ARGS) {
     fPushNullObjMethod(numArgs);
     return;
   }
+
+  // cheng-hack: check if the value is obj and blong to one class
+  if (UNLIKELY(c2->m_type == KindOfMulti)) {
+    START;
+    AS_MCALL;
+    cheng_assert(c2->m_data.pmulti->getType() == KindOfObject);
+
+    // check if the same obj
+    auto single = c2->m_data.pmulti->shrinkToSingle();
+    if (single != nullptr) {
+      ObjectData* obj = single->m_data.pobj;
+      Class* cls = obj->getVMClass();
+      StringData* name = c1->m_data.pstr;
+      // We handle decReffing obj and name in fPushObjMethodImpl
+      vmStack().ndiscard(2);
+      // safety check
+      cheng_assert(cls != nullptr && name != nullptr);
+      fPushObjMethodImpl(cls, name, obj, numArgs);
+    } else {
+      Class* cls = nullptr;
+      for (auto it : *c2->m_data.pmulti) {
+        if (cls == nullptr) {
+          cls = it->m_data.pobj->getVMClass();
+        } else {
+          cheng_assert(it->m_data.pobj->getVMClass() == cls);
+        }
+      }
+      // construct multi $this
+      sptr< std::vector<ObjectData*> > multi_obj = genMultiObj(c2->m_data.pmulti);
+      // do real work
+      vmStack().ndiscard(2);
+      StringData* name = c1->m_data.pstr;
+      // safety check
+      cheng_assert(cls != nullptr && name != nullptr);
+      fPushObjMethodImpl(cls, name, nullptr, numArgs, multi_obj);
+    }
+    END;
+  } else {
+    // normal case
   ObjectData* obj = c2->m_data.pobj;
   Class* cls = obj->getVMClass();
   StringData* name = c1->m_data.pstr;
   // We handle decReffing obj and name in fPushObjMethodImpl
   vmStack().ndiscard(2);
   fPushObjMethodImpl(cls, name, obj, numArgs);
+  }
 }
 
+// Support by fPushObjMethodImpl()
+//   Basically, we should check if this is multi-this
 OPTBLD_INLINE void iopFPushObjMethodD(IOP_ARGS) {
+  AS_CALL;
   pc++;
   auto numArgs = decode_iva(pc);
-  auto name = decode_litstr(pc);
+  auto name = decode_litstr(pc); // function name
   auto op = decode_oa<ObjMethodOp>(pc);
-  Cell* c1 = vmStack().topC();
-  if (c1->m_type != KindOfObject) {
+  Cell* c1 = vmStack().topC(); // object
+  // cheng-hack:
+  if (c1->m_type != KindOfObject && c1->m_type != KindOfMulti) {
     if (UNLIKELY(op == ObjMethodOp::NullThrows || !IS_NULL_TYPE(c1->m_type))) {
       throw_call_non_object(name->data(),
                             getDataTypeString(c1->m_type).get()->data());
@@ -5686,11 +10664,61 @@ OPTBLD_INLINE void iopFPushObjMethodD(IOP_ARGS) {
     fPushNullObjMethod(numArgs);
     return;
   }
+
+  // cheng-hack:
+  if (UNLIKELY(c1->m_type == KindOfMulti)) {
+    START;
+    AS_MCALL;
+    // FIXME: this should be fix by other iops
+    if (c1->m_data.pmulti->getType() == KindOfRef) {
+      *c1 = tvMayMultiToCell(c1);
+    }
+
+    cheng_assert(c1->m_data.pmulti->getType() == KindOfObject);
+
+    // check if the same obj
+    // cheng-hack: used to be a BUG. Since the RetC will decref the obj (the incref happen
+    // during CGetL, but multi-ref/multi-val will not incref), there will be segfault
+    // incref here.
+    auto single = c1->m_data.pmulti->shrinkToSingle();
+    if (single != nullptr) {
+      // normal case
+      ObjectData* obj = single->m_data.pobj;
+      // cheng-hack: incref here, to compensate the decref in RetC 
+      obj->incRefCount();
+      Class* cls = obj->getVMClass();
+      // We handle decReffing obj in fPushObjMethodImpl
+      vmStack().popC();
+      fPushObjMethodImpl(cls, name, obj, numArgs);
+    } else {
+      // check all the objs belongs to one class
+      Class* cls = nullptr;
+      for (auto it : *c1->m_data.pmulti) {
+        if (cls == nullptr) {
+          cls = it->m_data.pobj->getVMClass();
+        } else {
+          cheng_assert(it->m_data.pobj->getVMClass() == cls);
+        }
+      }
+      // construct multi $this, this **increase** the counter for the object
+      sptr< std::vector<ObjectData*> > multi_obj = genMultiObj(c1->m_data.pmulti);
+      // [We handle decReffing obj in fPushObjMethodImpl]:
+      // this is for ref of obj which is increased in genMultiObj()
+      // Here we decrease the ref for multi-value:
+      vmStack().popC();
+      // safety check
+      cheng_assert(cls != nullptr && name != nullptr);
+      fPushObjMethodImpl(cls, name, nullptr, numArgs, multi_obj);
+    }
+    END;
+  } else {
+    // normal case
   ObjectData* obj = c1->m_data.pobj;
   Class* cls = obj->getVMClass();
   // We handle decReffing obj in fPushObjMethodImpl
   vmStack().discard();
   fPushObjMethodImpl(cls, name, obj, numArgs);
+  }
 }
 
 template<bool forwarding>
@@ -5712,7 +10740,7 @@ void pushClsMethodImpl(Class* cls, StringData* name, ObjectData* obj,
   ActRec* ar = vmStack().allocA();
   ar->m_func = f;
   if (obj) {
-    ar->setThis(obj);
+    ar->setThisSingle(obj);
   } else {
     if (!forwarding) {
       ar->setClass(cls);
@@ -5720,7 +10748,8 @@ void pushClsMethodImpl(Class* cls, StringData* name, ObjectData* obj,
       /* Propagate the current late bound class if there is one, */
       /* otherwise use the class given by this instruction's input */
       if (vmfp()->hasThis()) {
-        cls = vmfp()->getThis()->getVMClass();
+        // cheng-hack:
+        cls = vmfp()->getThisDefault()->getVMClass();
       } else if (vmfp()->hasClass()) {
         cls = vmfp()->getClass();
       }
@@ -5737,13 +10766,17 @@ void pushClsMethodImpl(Class* cls, StringData* name, ObjectData* obj,
   }
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPushClsMethod(IOP_ARGS) {
+  AS_CALL;
   pc++;
   auto numArgs = decode_iva(pc);
   Cell* c1 = vmStack().indC(1); // Method name.
   if (!IS_STRING_TYPE(c1->m_type)) {
     raise_error(Strings::FUNCTION_NAME_MUST_BE_STRING);
   }
+  // cheng-hack: multiVal doesn't make sense
+  cheng_assert(c1->m_type != KindOfMulti);
   TypedValue* tv = vmStack().top();
   assert(tv->m_type == KindOfClass);
   Class* cls = tv->m_data.pcls;
@@ -5751,11 +10784,21 @@ OPTBLD_INLINE void iopFPushClsMethod(IOP_ARGS) {
   // pushClsMethodImpl will take care of decReffing name
   vmStack().ndiscard(2);
   assert(cls && name);
-  ObjectData* obj = vmfp()->hasThis() ? vmfp()->getThis() : nullptr;
+#ifdef CHENG_CHECK
+  if (vmfp()->hasThis() && vmfp()->isMultiThis()) {
+    START;END; // just for counting the #multi_ins
+    AS_MCALL;
+  }
+#endif
+  // cheng-hack: so far, it seems that just give a nullptr is OK
+  ObjectData* obj = (vmfp()->hasThis() && !vmfp()->isMultiThis()) ?
+    vmfp()->getThisSingle() : nullptr;
   pushClsMethodImpl<false>(cls, name, obj, numArgs);
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPushClsMethodD(IOP_ARGS) {
+  AS_CALL;
   pc++;
   auto numArgs = decode_iva(pc);
   auto name = decode_litstr(pc);
@@ -5766,11 +10809,21 @@ OPTBLD_INLINE void iopFPushClsMethodD(IOP_ARGS) {
   if (cls == nullptr) {
     raise_error(Strings::UNKNOWN_CLASS, nep.first->data());
   }
-  ObjectData* obj = vmfp()->hasThis() ? vmfp()->getThis() : nullptr;
+#ifdef CHENG_CHECK
+  if (vmfp()->hasThis() && vmfp()->isMultiThis()) {
+    START;END; // just for counting the #multi_ins
+    AS_MCALL;
+  }
+#endif
+  // cheng-hack: so far, it seems that just give a nullptr is OK
+  ObjectData* obj = (vmfp()->hasThis() && !vmfp()->isMultiThis()) ?
+    vmfp()->getThisSingle() : nullptr;
   pushClsMethodImpl<false>(cls, name, obj, numArgs);
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPushClsMethodF(IOP_ARGS) {
+  AS_CALL;
   pc++;
   auto numArgs = decode_iva(pc);
   Cell* c1 = vmStack().indC(1); // Method name.
@@ -5784,17 +10837,33 @@ OPTBLD_INLINE void iopFPushClsMethodF(IOP_ARGS) {
   StringData* name = c1->m_data.pstr;
   // pushClsMethodImpl will take care of decReffing name
   vmStack().ndiscard(2);
-  ObjectData* obj = vmfp()->hasThis() ? vmfp()->getThis() : nullptr;
+#ifdef CHENG_CHECK
+  if (vmfp()->hasThis() && vmfp()->isMultiThis()) {
+    START;END; // just for counting the #multi_ins
+    AS_MCALL;
+  }
+#endif
+  // cheng-hack: so far, it seems that just give a nullptr is OK
+  ObjectData* obj = (vmfp()->hasThis() && !vmfp()->isMultiThis()) ?
+    vmfp()->getThisSingle() : nullptr;
   pushClsMethodImpl<true>(cls, name, obj, numArgs);
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPushCtor(IOP_ARGS) {
+  AS_CALL;
   pc++;
   auto numArgs = decode_iva(pc);
   TypedValue* tv = vmStack().topTV();
-  assert(tv->m_type == KindOfClass);
+  cheng_assert(tv->m_type == KindOfClass);
   Class* cls = tv->m_data.pcls;
   assert(cls != nullptr);
+#ifdef CHENG_INS_DEBUG
+  debug_log << "    new class[" << cls->name()->toCppString() << "]\n";
+#endif
+  if (UNLIKELY(isBuiltinClass(cls->name()->toCppString()))) {
+    builtin_class_new = true; 
+  }
   // Lookup the ctor
   const Func* f;
   LookupResult res UNUSED = g_context->lookupCtorMethod(f, cls, true);
@@ -5810,12 +10879,14 @@ OPTBLD_INLINE void iopFPushCtor(IOP_ARGS) {
   // Push new activation record.
   ActRec* ar = vmStack().allocA();
   ar->m_func = f;
-  ar->setThis(this_);
+  ar->setThisSingle(this_);
   ar->initNumArgsFromFPushCtor(numArgs);
   ar->setVarEnv(nullptr);
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPushCtorD(IOP_ARGS) {
+  AS_CALL;
   pc++;
   auto numArgs = decode_iva(pc);
   auto id = decode<Id>(pc);
@@ -5825,6 +10896,12 @@ OPTBLD_INLINE void iopFPushCtorD(IOP_ARGS) {
   if (cls == nullptr) {
     raise_error(Strings::UNKNOWN_CLASS,
                 vmfp()->m_func->unit()->lookupLitstrId(id)->data());
+  }
+#ifdef CHENG_INS_DEBUG
+  debug_log << "    new class[" << cls->name()->toCppString() << "]\n";
+#endif
+  if (UNLIKELY(isBuiltinClass(cls->name()->toCppString()))) {
+    builtin_class_new = true; 
   }
   // Lookup the ctor
   const Func* f;
@@ -5839,12 +10916,14 @@ OPTBLD_INLINE void iopFPushCtorD(IOP_ARGS) {
   // Push new activation record.
   ActRec* ar = vmStack().allocA();
   ar->m_func = f;
-  ar->setThis(this_);
+  ar->setThisSingle(this_);
   ar->initNumArgsFromFPushCtor(numArgs);
   ar->setVarEnv(nullptr);
 }
 
+// Good to go
 OPTBLD_INLINE void iopDecodeCufIter(IOP_ARGS) {
+  AS_CALL;
   PC origPc = pc;
   pc++;
   auto itId = decode_ia(pc);
@@ -5857,6 +10936,10 @@ OPTBLD_INLINE void iopDecodeCufIter(IOP_ARGS) {
   HPHP::Class* cls = nullptr;
   StringData* invName = nullptr;
   TypedValue *func = vmStack().topTV();
+
+#ifdef CHENG_CHECK
+  cheng_assert(func->m_type != KindOfMulti);
+#endif
 
   ActRec* ar = vmfp();
   if (vmfp()->m_func->isBuiltin()) {
@@ -5882,7 +10965,9 @@ OPTBLD_INLINE void iopDecodeCufIter(IOP_ARGS) {
   vmStack().popC();
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPushCufIter(IOP_ARGS) {
+  AS_CALL;
   pc++;
   auto numArgs = decode_iva(pc);
   auto itId = decode_ia(pc);
@@ -5906,6 +10991,7 @@ OPTBLD_INLINE void iopFPushCufIter(IOP_ARGS) {
   ar->initNumArgs(numArgs);
 }
 
+// Used by FPushCuf/FPushCufF/FpushCufSafe
 OPTBLD_INLINE void doFPushCuf(PC& pc, bool forward, bool safe) {
   pc++;
   auto numArgs = decode_iva(pc);
@@ -5916,10 +11002,49 @@ OPTBLD_INLINE void doFPushCuf(PC& pc, bool forward, bool safe) {
   HPHP::Class* cls = nullptr;
   StringData* invName = nullptr;
 
-  const Func* f = vm_decode_function(tvAsVariant(&func), vmfp(),
+  const Func* f;
+
+  // cheng-hack: support multi-callback
+  bool no_obj = false;
+  sptr< std::vector<ObjectData*> >  multi_obj =
+               std::make_shared< std::vector<ObjectData*> >();
+  if (UNLIKELY(func.m_type == KindOfMulti)) {
+    START;
+    AS_MCALL;
+    ObjectData* t_obj = nullptr;
+    HPHP::Class* t_cls = nullptr;
+    StringData* t_invName = nullptr;
+
+    for (auto fit : *func.m_data.pmulti) {
+
+      const Func* tmp_f = vm_decode_function(tvAsVariant(fit), vmfp(),
+                             forward, t_obj, t_cls, t_invName, !safe);
+      if (cls == nullptr) {
+        cls = t_cls;
+        f = tmp_f;
+        invName = t_invName; // TODO: I don't know what is this!
+        no_obj = t_obj == nullptr ? true : false;
+      }
+      cheng_assert(cls == t_cls);
+      cheng_assert(f == tmp_f);
+      cheng_assert(invName == t_invName);
+      if (no_obj) { 
+        cheng_assert(t_obj == nullptr);
+      } else {
+        cheng_assert(t_obj != nullptr);
+        multi_obj->push_back(t_obj);
+        t_obj->incRefCount();
+        obj = t_obj; // make the latter condition happy
+      }
+    }
+    END;
+  } else {
+
+  f = vm_decode_function(tvAsVariant(&func), vmfp(),
                                      forward,
                                      obj, cls, invName,
                                      !safe);
+  }
 
   if (safe) vmStack().topTV()[1] = vmStack().topTV()[0];
   vmStack().ndiscard(1);
@@ -5935,14 +11060,27 @@ OPTBLD_INLINE void doFPushCuf(PC& pc, bool forward, bool safe) {
   ActRec* ar = vmStack().allocA();
   ar->m_func = f;
   if (obj) {
-    ar->setThis(obj);
+    // cheng-hack:
+    if (UNLIKELY(func.m_type == KindOfMulti)) {
+      ar->setThisMulti(multi_obj);
+#ifdef CHENG_INS_DEBUG
+      debug_log << "    FPushCuf setThisMulti\n";
+#endif
+    } else {
+    ar->setThisSingle(obj);
     obj->incRefCount();
+    }
   } else if (cls) {
     ar->setClass(cls);
   } else {
-    ar->setThis(nullptr);
+    ar->setThisSingle(nullptr);
   }
-  ar->initNumArgs(numArgs);
+  // cheng-hack:
+  if (UNLIKELY(func.m_type == KindOfMulti)) {
+    ar->initNumArgsFromMultiThis(numArgs);
+  } else {
+    ar->initNumArgs(numArgs);
+  }
   if (invName) {
     ar->setInvName(invName);
   } else {
@@ -5951,15 +11089,21 @@ OPTBLD_INLINE void doFPushCuf(PC& pc, bool forward, bool safe) {
   tvRefcountedDecRef(&func);
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPushCuf(IOP_ARGS) {
+  AS_CALL;
   doFPushCuf(pc, false, false);
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPushCufF(IOP_ARGS) {
+  AS_CALL;
   doFPushCuf(pc, true, false);
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPushCufSafe(IOP_ARGS) {
+  AS_CALL;
   doFPushCuf(pc, false, true);
 }
 
@@ -5967,14 +11111,18 @@ static inline ActRec* arFromInstr(TypedValue* sp, const Op* pc) {
   return arFromSpOffset((ActRec*)sp, instrSpToArDelta(pc));
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPassC(IOP_ARGS) {
+  AS_GET;
   DEBUG_ONLY auto const ar = arFromInstr(vmStack().top(), (Op*)pc);
   pc++;
   UNUSED auto paramId = decode_iva(pc);
   assert(paramId < ar->numArgs());
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPassCW(IOP_ARGS) {
+  AS_GET;
   auto const ar = arFromInstr(vmStack().top(), reinterpret_cast<const Op*>(pc));
   pc++;
   auto paramId = decode_iva(pc);
@@ -5985,7 +11133,9 @@ OPTBLD_INLINE void iopFPassCW(IOP_ARGS) {
   }
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPassCE(IOP_ARGS) {
+  AS_GET;
   auto const ar = arFromInstr(vmStack().top(), reinterpret_cast<const Op*>(pc));
   pc++;
   auto paramId = decode_iva(pc);
@@ -5996,18 +11146,33 @@ OPTBLD_INLINE void iopFPassCE(IOP_ARGS) {
   }
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPassV(IOP_ARGS) {
+  AS_GET;
   ActRec* ar = arFromInstr(vmStack().top(), (Op*)pc);
   pc++;
   auto paramId = decode_iva(pc);
   assert(paramId < ar->numArgs());
   const Func* func = ar->m_func;
   if (!func->byRef(paramId)) {
-    vmStack().unbox();
+    // cheng-hack:
+    if (UNLIKELY(vmStack().topTV()->m_type == KindOfMulti)) {
+      TypedValue* top = vmStack().topTV();
+#ifdef CHENG_CHECK
+      cheng_assert(top->m_data.pmulti->getType() == KindOfRef);
+#endif
+      unboxMulti(top);
+    } else {
+      // normal case
+      vmStack().unbox();
+    }
   }
 }
 
+// Good to go
+//  DO NOT KNOW: Can be multi-ref?
 OPTBLD_INLINE void iopFPassVNop(IOP_ARGS) {
+  AS_GET;
   DEBUG_ONLY auto const ar = arFromInstr(vmStack().top(), (Op*)pc);
   pc++;
   UNUSED auto paramId = decode_iva(pc);
@@ -6015,7 +11180,9 @@ OPTBLD_INLINE void iopFPassVNop(IOP_ARGS) {
   assert(ar->m_func->byRef(paramId));
 }
 
+// Good to go
 OPTBLD_INLINE void iopFPassR(IOP_ARGS) {
+  AS_GET;
   ActRec* ar = arFromInstr(vmStack().top(), (Op*)pc);
   pc++;
   auto paramId = decode_iva(pc);
@@ -6024,16 +11191,29 @@ OPTBLD_INLINE void iopFPassR(IOP_ARGS) {
   if (func->byRef(paramId)) {
     TypedValue* tv = vmStack().topTV();
     if (tv->m_type != KindOfRef) {
-      tvBox(tv);
+      if (UNLIKELY(tv->m_type == KindOfMulti)) {
+        tvBoxMulti(tv);
+      } else {
+        tvBox(tv);
+      }
     }
   } else {
+    // cheng-hack:
+    if (UNLIKELY(vmStack().topTV()->m_type == KindOfMulti)) {
+      TypedValue* mTv = vmStack().topTV();
+      if (mTv->m_data.pmulti->getType() == KindOfRef) {
+        unboxMulti(mTv);
+      }
+    }
     if (vmStack().topTV()->m_type == KindOfRef) {
       vmStack().unbox();
     }
   }
 }
 
+// Supported by cgetl_inner_body()
 OPTBLD_INLINE void iopFPassL(IOP_ARGS) {
+  AS_GET;
   ActRec* ar = arFromInstr(vmStack().top(), (Op*)pc);
   pc++;
   auto paramId = decode_iva(pc);
@@ -6048,6 +11228,7 @@ OPTBLD_INLINE void iopFPassL(IOP_ARGS) {
   }
 }
 
+// Use CGetN 
 OPTBLD_INLINE void iopFPassN(IOP_ARGS) {
   ActRec* ar = arFromInstr(vmStack().top(), (Op*)pc);
   PC origPc = pc;
@@ -6061,6 +11242,7 @@ OPTBLD_INLINE void iopFPassN(IOP_ARGS) {
   }
 }
 
+// Use CGetG
 OPTBLD_INLINE void iopFPassG(IOP_ARGS) {
   ActRec* ar = arFromInstr(vmStack().top(), (Op*)pc);
   PC origPc = pc;
@@ -6074,6 +11256,7 @@ OPTBLD_INLINE void iopFPassG(IOP_ARGS) {
   }
 }
 
+// Use CGetS
 OPTBLD_INLINE void iopFPassS(IOP_ARGS) {
   ActRec* ar = arFromInstr(vmStack().top(), (Op*)pc);
   PC origPc = pc;
@@ -6087,33 +11270,64 @@ OPTBLD_INLINE void iopFPassS(IOP_ARGS) {
   }
 }
 
+// Supported
 OPTBLD_INLINE void iopFPassM(IOP_ARGS) {
+  AS_MEMBER;
   ActRec* ar = arFromInstr(vmStack().top(), (Op*)pc);
   pc++;
   auto paramId = decode_iva(pc);
   assert(paramId < ar->numArgs());
+#ifdef CHENG_COUNT_INS
+  nested_ins_level_inc();
+#endif
   if (!ar->m_func->byRef(paramId)) {
     MemberState mstate;
     auto tvRet = getHelper(pc, mstate);
+    // cheng-hack: This is good to go, since the getHelper will
+    //             do the unbox for multi-ref
     if (tvRet->m_type == KindOfRef) {
       tvUnbox(tvRet);
     }
   } else {
     MemberState mstate;
+    // cheng-hack: 
+    // if we got multi-base/multi-index,
+    // we should make the multi-ref here
+    mstate.isMultiBase = false;
+    mstate.isVGetM = false;
     TypedValue* tv1 = vmStack().allocTV();
     tvWriteUninit(tv1);
     if (!setHelperPre<false, true, false, true, 1,
         VectorLeaveCode::ConsumeAll>(pc, mstate)) {
+      // cheng-hack:
+      if (UNLIKELY(mstate.isMultiBase)) {
+        TypedValue ret = MultiVal::makeMultiVal();
+        for (auto it : *mstate.base_list) {
+          if (it->m_type != KindOfRef) {
+            tvBox(it);
+          }
+          ret.m_data.pmulti->addValue(*it);
+        }
+#ifdef CHENG_CHECK
+        cheng_assert(ret.m_data.pmulti->getType() == KindOfRef);
+#endif
+        tvCopy(ret, *tv1);
+      } else {
+        // normal case
       if (mstate.base->m_type != KindOfRef) {
         tvBox(mstate.base);
       }
       refDup(*mstate.base, *tv1);
+      }
     } else {
       tvWriteNull(tv1);
       tvBox(tv1);
     }
     setHelperPost<1>(mstate.ndiscard);
   }
+#ifdef CHENG_COUNT_INS
+  nested_ins_level_dec();
+#endif
 }
 
 bool doFCall(ActRec* ar, PC& pc) {
@@ -6127,17 +11341,54 @@ bool doFCall(ActRec* ar, PC& pc) {
   return false;
 }
 
+// Good to go
 OPTBLD_INLINE void iopFCall(IOP_ARGS) {
+  AS_CALL;
   ActRec* ar = arFromInstr(vmStack().top(), (Op*)pc);
   pc++;
-  UNUSED auto numArgs = decode_iva(pc);
+  /*UNUSED*/ auto numArgs = decode_iva(pc);
+  // cheng-hack: if the builtin_class_new is true, which means POINT2 might be the case
+  // (1) check all the arguments, if there is any multival, do object split
+  // (2) if split, replace the this object on stack to multi_this
+  if (UNLIKELY(builtin_class_new)) {
+    int multi_size = 0;
+    TypedValue* rargs = vmStack().topTV();
+    for (int i = 0; i < numArgs; i ++) {
+      if (UNLIKELY(rargs[i].m_type == KindOfMulti)) {
+        multi_size = rargs[i].m_data.pmulti->valSize(); break;
+      }
+    }
+    if (multi_size != 0) {
+      cheng_assert(ar->hasThis());
+      // split object 
+      sptr< std::vector<ObjectData*> > multi_this_ = 
+               std::make_shared< std::vector<ObjectData*> >();
+      auto obj = ar->getThisSingle();
+      multi_this_->push_back(obj);
+      for (int i=1; i < multi_size; i++) {
+        ObjectData* clone = newInstance(obj->getVMClass());
+        multi_this_->push_back(clone); 
+      }
+      cheng_assert(multi_this_->size() == multi_size);
+      ar->setThisMulti(multi_this_);
+      // replace this on stack
+      TypedValue tv = genMultiVal(multi_this_);
+      auto this_ptr = rargs + numArgs + 3 /*sizeof frame*/;
+      cheng_assert(this_ptr->m_type == KindOfObject);
+      tvCopy(tv, *this_ptr);
+    }
+  }
+  builtin_class_new = false;
+
   assert(numArgs == ar->numArgs());
   checkStack(vmStack(), ar->m_func, 0);
   ar->setReturn(vmfp(), pc, mcg->tx().uniqueStubs.retHelper);
   doFCall(ar, pc);
 }
 
+// Good to go
 OPTBLD_INLINE void iopFCallD(IOP_ARGS) {
+  AS_CALL;
   auto const ar = arFromInstr(vmStack().top(), reinterpret_cast<const Op*>(pc));
   pc++;
   UNUSED auto numArgs = decode_iva(pc);
@@ -6153,7 +11404,10 @@ OPTBLD_INLINE void iopFCallD(IOP_ARGS) {
   doFCall(ar, pc);
 }
 
+// Support
+// FIXME: not handling when "this" is multivalue in a builtin method
 OPTBLD_INLINE void iopFCallBuiltin(IOP_ARGS) {
+  AS_CALL;
   pc++;
   auto numArgs = decode_iva(pc);
   auto numNonDefault = decode_iva(pc);
@@ -6166,6 +11420,268 @@ OPTBLD_INLINE void iopFCallBuiltin(IOP_ARGS) {
   }
   TypedValue* args = vmStack().indTV(numArgs-1);
   TypedValue ret;
+
+#ifdef CHENG_INS_ONLY_DEBUG
+  if (should_count && func->name() && func->name()->data()) {
+    debug_log << "     FCallBuiltin [" << func->name()->data() << "]\n";
+  }
+#endif
+#ifdef CHENG_COUNT_INS
+    nested_ins_level_inc();
+#endif
+
+  // cheng-hack:
+  // (1) check if the args have multiVal
+  bool multi_call = false; // whether we should do multicall
+  int call_num = 0;  // how many multivalue in args
+#ifdef CHENG_OPT_1
+  int batch_call_opt_num = 1;
+  bool same_following_val = true;
+#endif
+  // NOTE: since stack grow to low address, 
+  // args is the high address; rargs is the low address
+  TypedValue* rargs = vmStack().topTV();
+  std::vector<TypedValue*> ref_args, ref_multi_list, obj_args, multi_args;
+  std::vector<MultiVal*> obj_multi_list;
+  std::vector<MultiVal*> multi_val_list;
+  for (int i = 0; i < numArgs; i ++) {
+    if (UNLIKELY(rargs[i].m_type == KindOfMulti)) {
+      multi_call = true;
+      if (call_num == 0) call_num = rargs[i].m_data.pmulti->valSize();
+      multi_val_list.push_back(rargs[i].m_data.pmulti);
+      multi_args.push_back(&rargs[i]);
+    } else if (UNLIKELY(rargs[i].m_type == KindOfRef)) {
+      // We meet side-effect builtin function,
+      // record the ref, we will split it later
+      //std::cout << "  FCallBuiltin [" << func->name()->data() << "] with ref\n";
+      if (tvToCell(&rargs[i])->m_type == KindOfMulti) {
+        //std::cout << "  FCallBuiltin [" << func->name()->data() << "] with ref to multi\n";
+        call_num = tvToCell(&rargs[i])->m_data.pmulti->valSize();
+        multi_call = true;
+      }
+      ref_args.push_back(&rargs[i]);
+    } else if (UNLIKELY(rargs[i].m_type == KindOfObject)) {
+      // We meet side-effect builtin function,
+      // record the obj, we will split it later if necessary
+      int num = MultiVal::containMultiVal(&rargs[i]);
+      if (num != 0) {
+        call_num = num; 
+        multi_call = true;
+      }
+      obj_args.push_back(&rargs[i]);
+    }
+  }
+  // (2) check if builtin function should be bypass
+  if (UNLIKELY(multi_call && isBypassFunc(func->name()->data()))) {
+    multi_call = false;
+  }
+  // call_counter indicates which turn are we in
+  int call_counter = 0;
+  TypedValue result;
+  TypedValue orig_stack[numArgs];
+
+  if (UNLIKELY(multi_call)) {START; AS_MCALL;} 
+
+  if (UNLIKELY(single_mode_on && multi_call)) {
+    for (int i = 0; i < multi_args.size(); i++) {
+      // need change multi to single
+      TypedValue *tmptv = multi_val_list[i]->getByVal(single_mode_cur_iter);
+      tvDup(*tmptv, *multi_args[i]); // here will increase the inner counter
+      //tvCopy(*tmptv, *multi_args[i]);
+    }
+    multi_call = false;
+  }
+
+multicall_begin:
+  if (UNLIKELY(multi_call)) {
+    // (3) Initial everything in the very beginning
+    if (call_counter == 0) {
+#ifdef CHENG_INS_DEBUG
+    debug_log << "  FCallBuiltin [" << func->name()->data() << "] with "
+      << " multi values. Args are: \n";
+    for (int i = 0; i < numArgs; i++) {
+      debug_log << "    " << rargs[i].pretty();
+    }
+#endif
+      result = MultiVal::makeMultiVal();
+      memcpy(orig_stack, rargs, sizeof(struct TypedValue)*numArgs);
+      // split the non-multi ref_args
+      // NOTE: this is tricky since we will have ref to multival
+      if (ref_args.size() != 0) {
+        for (auto ref_it : ref_args) {
+          TypedValue *cell = ref_it->m_data.pref->tv();
+          // if the ref is point to single element, split it!
+          if (cell->m_type != KindOfMulti) {
+            TypedValue tmp = splitElements(cell, call_num);
+            tvRefcountedIncRef(cell);
+            tvCopy(tmp, *cell);
+          }
+          // save the original 
+          ref_multi_list.push_back(cell);
+        }
+      }
+      // split the non-multi object
+      if (obj_args.size() != 0) {
+        for (auto obj_it : obj_args) {
+          auto orig_obj_ptr = obj_it->m_data.pobj;
+          // if the obj is single, split it
+          if (!MultiVal::containMultiVal(obj_it)) {
+            TypedValue tmp = splitElements(obj_it, call_num);
+            tvCopy(tmp, *obj_it);
+          } else {
+            TypedValue tmp = MultiVal::transferObj(*obj_it);
+            tvCopy(tmp, *obj_it);
+          }
+          obj_multi_list.push_back(obj_it->m_data.pmulti);
+          // the original obj ptr is in orig_obj_ptr
+          // the new multi-obj is in *obj_it
+          // replace the obj on stack/global space 
+          auto f = [orig_obj_ptr, obj_it] (TypedValue* tv) {
+            if (tv->m_type == KindOfObject && 
+                tv->m_data.pobj == orig_obj_ptr) {
+#ifdef CHENG_INS_DEBUG
+              debug_log << "    replace obj {" << tv->pretty() << "} at location "
+                << tv << " into multi-obj\n";
+#endif
+              tvRefcountedDecRef(tv);
+              tvDup(*obj_it, *tv); 
+            }
+          };
+          // FIXME: there are three more: class static/array/object
+          iterGlobalVar(f);
+          iterLocalVar(f);
+        }
+      }
+    }
+
+    // (4) collect the result, and check if end
+    if (call_counter > 0) {
+#ifdef CHENG_OPT_1
+      // there might be multiple same result
+      for (int i = 0; i < batch_call_opt_num; i++) {
+        result.m_data.pmulti->addValue(ret);
+      }
+#else
+        // for the ret tv, there is one ref 
+        result.m_data.pmulti->addValueNoInc(ret);
+#endif
+      for (int i = 0; i < ref_args.size(); i++) {
+#ifdef CHENG_INS_DEBUG
+        auto txt_ref = HHVM_FN(print_r)(tvAsVariant(tvToCell(ref_args[i])), true);
+        debug_log << "   After Round[" << call_counter << "] " << i << "th Ref:[[" << txt_ref.toString().toCppString() << "]]\n";
+#endif
+      }
+#ifdef CHENG_INS_DEBUG
+      debug_log << "  Iter[" << call_counter << "], result is:" 
+        << ret.pretty() << "\n";
+#endif
+    }
+
+    if (call_counter >= call_num) {
+      // USED TO BE A BUG: at the end of the call, the argument on stack will be removed
+      //    with the reference decrease, that may make the multi-value a dangling pointer.
+      //    So, we need to replace the argument here.
+      memcpy(rargs, orig_stack, sizeof(TypedValue)*numArgs); // recover to original args
+      // this is end, THERE IS NO RETURN!
+#ifdef CHENG_INS_DEBUG
+      debug_log << "  Return Value is:\n"  << result.m_data.pmulti->dump("    ");
+#endif
+
+      // Optimization, shrink, not sure if good for performance or bad
+      TypedValue *shrink = result.m_data.pmulti->shrinkToSingle();
+      if (shrink == nullptr) {
+        // move the multi-result to ret 
+        // they all have one ref-count in multival
+        tvCopy(result, ret);
+      } else {
+        tvDup(*shrink, ret); 
+        tvRefcountedDecRef(&result);
+      }
+
+      // update the ref-multi type
+      for (auto ref_multi : ref_multi_list) {
+        auto type = ref_multi->m_data.pmulti->getByVal(0)->m_type;
+#ifdef CHENG_CHECK
+        for (auto it : *ref_multi->m_data.pmulti) {
+          cheng_assert(it->m_type == type);
+        }
+#endif
+        ref_multi->m_data.pmulti->setType(type);
+      }
+      END;
+      single_mode_on = false;
+#ifdef CHENG_INS_ONLY_DEBUG
+    debug_log << "single_mode_on = false\n";
+#endif
+      single_mode_cur_iter = -1;
+      goto multicall_end;
+    }
+
+    // (5) prepare the single value call args
+    // no need to do this, if multi will be updated later, if non-multi will be the same
+    //memcpy(rargs, orig_stack, sizeof(TypedValue)*numArgs); // recover to original args
+    for (int i = 0; i < multi_args.size(); i++) {
+      // need change multi to single
+      if (call_counter > 0) tvRefcountedDecRef(multi_args[i]);
+      TypedValue *tmptv = multi_val_list[i]->getByVal(call_counter);
+      tvDup(*tmptv, *multi_args[i]); // here will increase the inner counter
+      //tvCopy(*tmptv, *multi_args[i]);
+    }
+    // NOTE: if there is one single value which has side effect,
+    // what should we do? Split and copy.
+    for (int i = 0; i < ref_args.size(); i++) {
+      // ref_args[i] points to the location on stack
+      // FIXME: this is dangerous!
+      ref_args[i]->m_data.pref = (RefData *) ref_multi_list[i]->m_data.pmulti->getByVal(call_counter);
+#ifdef CHENG_INS_DEBUG
+      auto txt_ref = HHVM_FN(print_r)(tvAsVariant(tvToCell(ref_args[i])), true);
+      debug_log << "    Round[" << (call_counter+1) << "] " << i << "th Ref:[[" << txt_ref.toString().toCppString() << "]]\n";
+#endif
+    }
+    // replace multi-obj with single-obj
+    for (int i = 0; i < obj_args.size(); i++) {
+      // obj_args[i] points to the location on stack, and it is multi-obj
+      tvCopy(*obj_multi_list[i]->getByVal(call_counter), *obj_args[i]);
+    }
+    // If we are here, it means we are not in the single_mode
+    single_mode_on = true;
+#ifdef CHENG_INS_ONLY_DEBUG
+    debug_log << "single_mode_on = true\n";
+#endif
+    single_mode_cur_iter = call_counter;
+    single_mode_size = obj_args.size();
+
+#ifdef CHENG_OPT_1
+    // batch_call optimization
+    // check if the following multi-values are the same
+    batch_call_opt_num = 1;
+    same_following_val = true;
+    while( (call_counter+batch_call_opt_num < call_num)  // call_counter + batch_call_opt_num is the index
+          & same_following_val) {
+      for (int i = 0; i < multi_args.size(); i++) {
+        TypedValue *tmptv = multi_val_list[i]->getByVal(call_counter + batch_call_opt_num);
+        if( multi_args[i]->m_type != tmptv->m_type || multi_args[i]->m_data.num != tmptv->m_data.num) {
+          same_following_val = false;
+          break;
+        }
+      }
+      for (int i = 0; i < ref_args.size(); i++) {
+        // ref_args[i] points to the location on stack
+        if (ref_args[i]->m_data.pref != (RefData *) ref_multi_list[i]->m_data.pmulti->getByVal(call_counter + batch_call_opt_num)) {
+          same_following_val = false;
+          break;
+        }
+      }
+      if (same_following_val) {
+        batch_call_opt_num++;
+      }
+    }
+    call_counter+=batch_call_opt_num;
+#else
+    call_counter++;
+#endif
+  }
+
   if (Native::coerceFCallArgs(args, numArgs, numNonDefault, func)) {
     Native::callFunc<true, false>(func, nullptr, args, ret);
   } else {
@@ -6178,9 +11694,19 @@ OPTBLD_INLINE void iopFCallBuiltin(IOP_ARGS) {
     }
   }
 
+  // cheng-hack:
+  if (multi_call) {
+    goto multicall_begin;
+  }
+multicall_end:
+
   frame_free_args(args, numNonDefault);
   vmStack().ndiscard(numArgs);
   tvCopy(ret, *vmStack().allocTV());
+
+#ifdef CHENG_COUNT_INS
+    nested_ins_level_dec();
+#endif
 }
 
 enum class CallArrOnInvalidContainer {
@@ -6192,6 +11718,7 @@ enum class CallArrOnInvalidContainer {
   WarnAndContinue
 };
 
+// supported inside prepareArrayArgs() 
 static bool doFCallArray(PC& pc, int numStackValues,
                          CallArrOnInvalidContainer onInvalid) {
   assert(numStackValues >= 1);
@@ -6258,6 +11785,7 @@ static bool doFCallArray(PC& pc, int numStackValues,
   return true;
 }
 
+// Supported
 bool doFCallArrayTC(PC pc) {
   assert_native_stack_aligned();
   assert(tl_regState == VMRegState::DIRTY);
@@ -6267,12 +11795,16 @@ bool doFCallArrayTC(PC pc) {
   return ret;
 }
 
+// Support 
 OPTBLD_INLINE void iopFCallArray(IOP_ARGS) {
+  AS_CALL;
   pc++;
   doFCallArray(pc, 1, CallArrOnInvalidContainer::CastToArray);
 }
 
+// Support 
 OPTBLD_INLINE void iopFCallUnpack(IOP_ARGS) {
+  AS_CALL;
   ActRec* ar = arFromInstr(vmStack().top(), (Op*)pc);
   pc++;
   auto numArgs = decode_iva(pc);
@@ -6281,9 +11813,15 @@ OPTBLD_INLINE void iopFCallUnpack(IOP_ARGS) {
   doFCallArray(pc, numArgs, CallArrOnInvalidContainer::WarnAndContinue);
 }
 
+// Not Impl
 OPTBLD_INLINE void iopCufSafeArray(IOP_ARGS) {
+  AS_CALL;
   pc++;
   Array ret;
+#ifdef CHENG_CHECK
+  cheng_assert(vmStack().topTV()->m_type != KindOfMulti);
+  cheng_assert(vmStack().indTV(1)->m_type != KindOfMulti);
+#endif
   ret.append(tvAsVariant(vmStack().top() + 1));
   ret.appendWithRef(tvAsVariant(vmStack().top() + 0));
   vmStack().popTV();
@@ -6291,8 +11829,15 @@ OPTBLD_INLINE void iopCufSafeArray(IOP_ARGS) {
   tvAsVariant(vmStack().top()) = ret;
 }
 
+// Not Impl
 OPTBLD_INLINE void iopCufSafeReturn(IOP_ARGS) {
+  AS_CALL;
   pc++;
+#ifdef CHENG_CHECK
+  cheng_assert(vmStack().topTV()->m_type != KindOfMulti);
+  cheng_assert(vmStack().indTV(1)->m_type != KindOfMulti);
+  cheng_assert(vmStack().indTV(2)->m_type != KindOfMulti);
+#endif
   bool ok = cellToBool(*tvToCell(vmStack().top() + 1));
   tvRefcountedDecRef(vmStack().top() + 1);
   tvRefcountedDecRef(vmStack().top() + (ok ? 2 : 0));
@@ -6300,6 +11845,8 @@ OPTBLD_INLINE void iopCufSafeReturn(IOP_ARGS) {
   vmStack().ndiscard(2);
 }
 
+// cheng-hack:
+//   iter->init() may generate multi-iterator
 inline bool initIterator(PC& pc, PC& origPc, Iter* it,
                          Offset offset, Cell* c1) {
   bool hasElems = it->init(c1);
@@ -6310,21 +11857,39 @@ inline bool initIterator(PC& pc, PC& origPc, Iter* it,
   return hasElems;
 }
 
+// cheng-hack:
+//    Support in initIterator()
 OPTBLD_INLINE void iopIterInit(IOP_ARGS) {
+  AS_ITER;
   PC origPc = pc;
   pc++;
   auto itId = decode_ia(pc);
   auto offset = decode<Offset>(pc);
   auto val = decode_la(pc);
   Cell* c1 = vmStack().topC();
+
   Iter* it = frame_iter(vmfp(), itId);
   TypedValue* tv1 = frame_local(vmfp(), val);
+  // cheng-hack: c1 can be multi-value
   if (initIterator(pc, origPc, it, offset, c1)) {
-    tvAsVariant(tv1) = it->arr().second();
+    // cheng-hack:
+    if (UNLIKELY(it->isMulti())) {
+      START;
+      AS_MITER;
+      // used BUG: need to free the prev variable on tv1
+      tvRefcountedDecRef(*tv1);
+      tvCopy(it->arrSecond(), *tv1);
+      END;
+    } else {
+      tvAsVariant(tv1) = it->arr().second();
+    }
   }
 }
 
+// cheng-hack:
+//    Support in initIterator()
 OPTBLD_INLINE void iopIterInitK(IOP_ARGS) {
+  AS_ITER;
   PC origPc = pc;
   pc++;
   auto itId = decode_ia(pc);
@@ -6336,12 +11901,24 @@ OPTBLD_INLINE void iopIterInitK(IOP_ARGS) {
   TypedValue* tv1 = frame_local(vmfp(), val);
   TypedValue* tv2 = frame_local(vmfp(), key);
   if (initIterator(pc, origPc, it, offset, c1)) {
-    tvAsVariant(tv1) = it->arr().second();
-    tvAsVariant(tv2) = it->arr().first();
+    // cheng-hack:
+    if (UNLIKELY(it->isMulti())) {
+      START;
+      AS_MITER;
+      // the return value can be multi
+      tvCopy(it->arrSecond(), *tv1);
+      tvCopy(it->arrFirst(), *tv2);
+      END;
+    } else {
+      tvAsVariant(tv1) = it->arr().second();
+      tvAsVariant(tv2) = it->arr().first();
+    }
   }
 }
 
+// Not Impl
 OPTBLD_INLINE void iopWIterInit(IOP_ARGS) {
+  AS_ITER;
   PC origPc = pc;
   pc++;
   auto itId = decode_ia(pc);
@@ -6351,11 +11928,17 @@ OPTBLD_INLINE void iopWIterInit(IOP_ARGS) {
   Iter* it = frame_iter(vmfp(), itId);
   TypedValue* tv1 = frame_local(vmfp(), val);
   if (initIterator(pc, origPc, it, offset, c1)) {
+    // cheng-hack: we do not support it for now
+    cheng_assert(!it->isMulti());
     tvAsVariant(tv1).setWithRef(it->arr().secondRef());
   }
+  // cheng-hack: not support multival yet
+  it->setMultiVal(false);
 }
 
+// Not Impl
 OPTBLD_INLINE void iopWIterInitK(IOP_ARGS) {
+  AS_ITER;
   PC origPc = pc;
   pc++;
   auto itId = decode_ia(pc);
@@ -6367,9 +11950,13 @@ OPTBLD_INLINE void iopWIterInitK(IOP_ARGS) {
   TypedValue* tv1 = frame_local(vmfp(), val);
   TypedValue* tv2 = frame_local(vmfp(), key);
   if (initIterator(pc, origPc, it, offset, c1)) {
+    // cheng-hack: we do not support it for now
+    cheng_assert(!it->isMulti());
     tvAsVariant(tv1).setWithRef(it->arr().secondRef());
     tvAsVariant(tv2) = it->arr().first();
   }
+  // cheng-hack: not support multival yet
+  it->setMultiVal(false);
 }
 
 
@@ -6377,6 +11964,10 @@ inline bool initIteratorM(PC& pc, PC& origPc, Iter* it, Offset offset,
                           Ref* r1, TypedValue *val, TypedValue *key) {
   bool hasElems = false;
   TypedValue* rtv = r1->m_data.pref->tv();
+  // cheng-hack:
+  if (UNLIKELY(rtv->m_type == KindOfMulti)) {
+    cheng_assert(false);
+  }
   if (rtv->m_type == KindOfArray) {
     hasElems = new_miter_array_key(it, r1->m_data.pref, val, key);
   } else if (rtv->m_type == KindOfObject)  {
@@ -6394,20 +11985,29 @@ inline bool initIteratorM(PC& pc, PC& origPc, Iter* it, Offset offset,
   return hasElems;
 }
 
+// Not Impl
 OPTBLD_INLINE void iopMIterInit(IOP_ARGS) {
+  AS_ITER;
   PC origPc = pc;
   pc++;
   auto itId = decode_ia(pc);
   auto offset = decode<Offset>(pc);
   auto val = decode_la(pc);
   Ref* r1 = vmStack().topV();
+#ifdef CHENG_CHECK
+  cheng_assert(r1->m_type != KindOfMulti);
+#endif
   assert(r1->m_type == KindOfRef);
   Iter* it = frame_iter(vmfp(), itId);
   TypedValue* tv1 = frame_local(vmfp(), val);
   initIteratorM(pc, origPc, it, offset, r1, tv1, nullptr);
+  // cheng-hack: not support multival yet
+  it->setMultiVal(false);
 }
 
+// Not Impl
 OPTBLD_INLINE void iopMIterInitK(IOP_ARGS) {
+  AS_ITER;
   PC origPc = pc;
   pc++;
   auto itId = decode_ia(pc);
@@ -6415,14 +12015,21 @@ OPTBLD_INLINE void iopMIterInitK(IOP_ARGS) {
   auto val = decode_la(pc);
   auto key = decode_la(pc);
   Ref* r1 = vmStack().topV();
+#ifdef CHENG_CHECK
+  cheng_assert(r1->m_type != KindOfMulti);
+#endif
   assert(r1->m_type == KindOfRef);
   Iter* it = frame_iter(vmfp(), itId);
   TypedValue* tv1 = frame_local(vmfp(), val);
   TypedValue* tv2 = frame_local(vmfp(), key);
   initIteratorM(pc, origPc, it, offset, r1, tv1, tv2);
+  // cheng-hack: not support multival yet
+  it->setMultiVal(false);
 }
 
+// Support
 OPTBLD_INLINE void iopIterNext(IOP_ARGS) {
+  AS_ITER;
   PC origPc = pc;
   pc++;
   auto itId = decode_ia(pc);
@@ -6433,11 +12040,25 @@ OPTBLD_INLINE void iopIterNext(IOP_ARGS) {
   TypedValue* tv1 = frame_local(vmfp(), val);
   if (it->next()) {
     pc = origPc + offset;
-    tvAsVariant(tv1) = it->arr().second();
+    // cheng-hack:
+    if (UNLIKELY(it->isMulti())) {
+      START;
+      AS_MITER;
+      // FIXME: in the original case, it use tvAsVariant, which may 
+      //        generatee different behavior to tvCopy
+      // used BUG: need to free the prev variable on tv1
+      tvRefcountedDecRef(*tv1);
+      tvCopy(it->arrSecond(), *tv1);
+      END;
+    } else {
+      tvAsVariant(tv1) = it->arr().second();
+    }
   }
 }
 
+// Support
 OPTBLD_INLINE void iopIterNextK(IOP_ARGS) {
+  AS_ITER;
   PC origPc = pc;
   pc++;
   auto itId = decode_ia(pc);
@@ -6450,12 +12071,25 @@ OPTBLD_INLINE void iopIterNextK(IOP_ARGS) {
   TypedValue* tv2 = frame_local(vmfp(), key);
   if (it->next()) {
     pc = origPc + offset;
-    tvAsVariant(tv1) = it->arr().second();
-    tvAsVariant(tv2) = it->arr().first();
+    // cheng-hack:
+    if (UNLIKELY(it->isMulti())) {
+      START;
+      AS_MITER;
+      // FIXME: in the original case, it use tvAsVariant, which may 
+      //        generatee different behavior to tvCopy
+      tvCopy(it->arrSecond(), *tv1);
+      tvCopy(it->arrFirst(), *tv2);
+      END;
+    } else {
+      tvAsVariant(tv1) = it->arr().second();
+      tvAsVariant(tv2) = it->arr().first();
+    }
   }
 }
 
+// Not Impl
 OPTBLD_INLINE void iopWIterNext(IOP_ARGS) {
+  AS_ITER;
   PC origPc = pc;
   pc++;
   auto itId = decode_ia(pc);
@@ -6464,13 +12098,17 @@ OPTBLD_INLINE void iopWIterNext(IOP_ARGS) {
   jmpSurpriseCheck(offset);
   Iter* it = frame_iter(vmfp(), itId);
   TypedValue* tv1 = frame_local(vmfp(), val);
+  // Not support for now
+  cheng_assert(!it->isMulti());
   if (it->next()) {
     pc = origPc + offset;
     tvAsVariant(tv1).setWithRef(it->arr().secondRef());
   }
 }
 
+// Not Impl 
 OPTBLD_INLINE void iopWIterNextK(IOP_ARGS) {
+  AS_ITER;
   PC origPc = pc;
   pc++;
   auto itId = decode_ia(pc);
@@ -6481,6 +12119,8 @@ OPTBLD_INLINE void iopWIterNextK(IOP_ARGS) {
   Iter* it = frame_iter(vmfp(), itId);
   TypedValue* tv1 = frame_local(vmfp(), val);
   TypedValue* tv2 = frame_local(vmfp(), key);
+  // Not support for now
+  cheng_assert(!it->isMulti());
   if (it->next()) {
     pc = origPc + offset;
     tvAsVariant(tv1).setWithRef(it->arr().secondRef());
@@ -6488,7 +12128,9 @@ OPTBLD_INLINE void iopWIterNextK(IOP_ARGS) {
   }
 }
 
+// Not Impl 
 OPTBLD_INLINE void iopMIterNext(IOP_ARGS) {
+  AS_ITER;
   PC origPc = pc;
   pc++;
   auto itId = decode_ia(pc);
@@ -6496,13 +12138,17 @@ OPTBLD_INLINE void iopMIterNext(IOP_ARGS) {
   auto val = decode_la(pc);
   jmpSurpriseCheck(offset);
   Iter* it = frame_iter(vmfp(), itId);
+  // Not support for now
+  cheng_assert(!it->isMulti());
   TypedValue* tv1 = frame_local(vmfp(), val);
   if (miter_next_key(it, tv1, nullptr)) {
     pc = origPc + offset;
   }
 }
 
+// Not Impl
 OPTBLD_INLINE void iopMIterNextK(IOP_ARGS) {
+  AS_ITER;
   PC origPc = pc;
   pc++;
   auto itId = decode_ia(pc);
@@ -6511,6 +12157,8 @@ OPTBLD_INLINE void iopMIterNextK(IOP_ARGS) {
   auto key = decode_la(pc);
   jmpSurpriseCheck(offset);
   Iter* it = frame_iter(vmfp(), itId);
+  // Not support for now
+  cheng_assert(!it->isMulti());
   TypedValue* tv1 = frame_local(vmfp(), val);
   TypedValue* tv2 = frame_local(vmfp(), key);
   if (miter_next_key(it, tv1, tv2)) {
@@ -6518,30 +12166,58 @@ OPTBLD_INLINE void iopMIterNextK(IOP_ARGS) {
   }
 }
 
+// support in it->free()
 OPTBLD_INLINE void iopIterFree(IOP_ARGS) {
+  AS_ITER;
   pc++;
   auto itId = decode_ia(pc);
   Iter* it = frame_iter(vmfp(), itId);
   it->free();
 }
 
+// Not Impl 
 OPTBLD_INLINE void iopMIterFree(IOP_ARGS) {
+  AS_ITER;
   pc++;
   auto itId = decode_ia(pc);
   Iter* it = frame_iter(vmfp(), itId);
+  // Not support for now
+  cheng_assert(!it->isMulti());
   it->mfree();
 }
 
+// Not Impl 
 OPTBLD_INLINE void iopCIterFree(IOP_ARGS) {
+  AS_ITER;
   pc++;
   auto itId = decode_ia(pc);
   Iter* it = frame_iter(vmfp(), itId);
+  // Not support for now
+  // FIXME: I don't know why this will called for an uninitialized iterators
+  // BUG situation: free itId=0, but only init itId=1
+  // cheng_assert(!it->isMulti());
+  it->setMultiVal(false);
   it->cfree();
 }
 
+// Should never include multiple files
 OPTBLD_INLINE void inclOp(PC& pc, InclOpFlags flags) {
   pc++;
   Cell* c1 = vmStack().topC();
+
+  // cheng-hack:
+#ifdef CHENG_INS_DEBUG
+  auto txt = HHVM_FN(print_r)(tvAsVariant(c1), true); 
+  debug_log << "    include file " << txt.toString().toCppString() << "\n";
+#endif
+  if (UNLIKELY(c1->m_type == KindOfMulti)) {
+    auto single = c1->m_data.pmulti->shrinkToSingle();
+    if (single != nullptr) {
+      tvCopy(*single, *c1);
+    }
+  }
+  cheng_assert(c1->m_type != KindOfMulti);
+
   String path(prepareKey(*c1));
   bool initial;
   TRACE(2, "inclOp %s %s %s %s \"%s\"\n",
@@ -6590,26 +12266,32 @@ OPTBLD_INLINE void inclOp(PC& pc, InclOpFlags flags) {
   }
 }
 
+// Good to go
 OPTBLD_INLINE void iopIncl(IOP_ARGS) {
   inclOp(pc, InclOpFlags::Default);
 }
 
+// Good to go
 OPTBLD_INLINE void iopInclOnce(IOP_ARGS) {
   inclOp(pc, InclOpFlags::Once);
 }
 
+// Good to go
 OPTBLD_INLINE void iopReq(IOP_ARGS) {
   inclOp(pc, InclOpFlags::Fatal);
 }
 
+// Good to go
 OPTBLD_INLINE void iopReqOnce(IOP_ARGS) {
   inclOp(pc, InclOpFlags::Fatal | InclOpFlags::Once);
 }
 
+// Good to go
 OPTBLD_INLINE void iopReqDoc(IOP_ARGS) {
   inclOp(pc, InclOpFlags::Fatal | InclOpFlags::Once | InclOpFlags::DocRoot);
 }
 
+// Good to go
 OPTBLD_INLINE void iopEval(IOP_ARGS) {
   pc++;
   Cell* c1 = vmStack().topC();
@@ -6656,6 +12338,7 @@ OPTBLD_INLINE void iopEval(IOP_ARGS) {
   vm->evalUnit(unit, pc, EventHook::Eval);
 }
 
+// Good to go
 OPTBLD_INLINE void iopDefFunc(IOP_ARGS) {
   pc++;
   auto fid = decode_iva(pc);
@@ -6663,6 +12346,7 @@ OPTBLD_INLINE void iopDefFunc(IOP_ARGS) {
   setCachedFunc(f, isDebuggerAttached());
 }
 
+// Good to go
 OPTBLD_INLINE void iopDefCls(IOP_ARGS) {
   pc++;
   auto cid = decode_iva(pc);
@@ -6670,11 +12354,13 @@ OPTBLD_INLINE void iopDefCls(IOP_ARGS) {
   Unit::defClass(c);
 }
 
+// Good to go
 OPTBLD_INLINE void iopDefClsNop(IOP_ARGS) {
   pc++;
   decode_iva(pc); // cid
 }
 
+// Good to go
 OPTBLD_INLINE void iopDefTypeAlias(IOP_ARGS) {
   pc++;
   auto tid = decode_iva(pc);
@@ -6687,19 +12373,45 @@ static inline void checkThis(ActRec* fp) {
   }
 }
 
+// Support
 OPTBLD_INLINE void iopThis(IOP_ARGS) {
+  AS_MISC;
   pc++;
   checkThis(vmfp());
-  ObjectData* this_ = vmfp()->getThis();
+  // cheng-hack:
+  if (UNLIKELY(vmfp()->isMultiThis())) {
+    START;
+    AS_MMISC;
+    auto this_ = vmfp()->getThisMulti();
+    TypedValue tv = genMultiVal(this_);
+    vmStack().pushMultiObject(tv);
+    END;
+  } else {
+    // normal case
+  ObjectData* this_ = vmfp()->getThisSingle();
   vmStack().pushObject(this_);
+  }
 }
 
+// Support
 OPTBLD_INLINE void iopBareThis(IOP_ARGS) {
+  AS_MISC;
   pc++;
   auto bto = decode_oa<BareThisOp>(pc);
   if (vmfp()->hasThis()) {
-    ObjectData* this_ = vmfp()->getThis();
+    // cheng-hack:
+    if (UNLIKELY(vmfp()->isMultiThis())) {
+      START;
+      AS_MMISC;
+      auto this_ = vmfp()->getThisMulti();
+      TypedValue tv = genMultiVal(this_);
+      vmStack().pushMultiObject(tv);
+      END;
+    } else {
+      // normal case
+    ObjectData* this_ = vmfp()->getThisSingle();
     vmStack().pushObject(this_);
+    }
   } else {
     vmStack().pushNull();
     switch (bto) {
@@ -6712,20 +12424,29 @@ OPTBLD_INLINE void iopBareThis(IOP_ARGS) {
   }
 }
 
+// Good to go
 OPTBLD_INLINE void iopCheckThis(IOP_ARGS) {
   pc++;
   checkThis(vmfp());
 }
 
+// Good to go
 OPTBLD_INLINE void iopInitThisLoc(IOP_ARGS) {
   pc++;
   auto id = decode_la(pc);
   TypedValue* thisLoc = frame_local(vmfp(), id);
   tvRefcountedDecRef(thisLoc);
   if (vmfp()->hasThis()) {
-    thisLoc->m_data.pobj = vmfp()->getThis();
+    // cheng-hack:
+    if (UNLIKELY(vmfp()->isMultiThis())) {
+      TypedValue tv = genMultiVal(vmfp()->getThisMulti());
+      tvCopy(tv, *thisLoc);
+    } else {
+      // normal case
+    thisLoc->m_data.pobj = vmfp()->getThisSingle();
     thisLoc->m_type = KindOfObject;
     tvIncRef(thisLoc);
+    }
   } else {
     tvWriteUninit(thisLoc);
   }
@@ -6748,6 +12469,7 @@ static inline RefData* lookupStatic(StringData* name,
   return refData.get();
 }
 
+// Support by tvBindMulti()
 OPTBLD_INLINE void iopStaticLoc(IOP_ARGS) {
   pc++;
   auto localId = decode_la(pc);
@@ -6761,7 +12483,8 @@ OPTBLD_INLINE void iopStaticLoc(IOP_ARGS) {
 
   auto const tvLocal = frame_local(vmfp(), localId);
   auto const tmpTV = make_tv<KindOfRef>(refData);
-  tvBind(&tmpTV, tvLocal);
+  //tvBind(&tmpTV, tvLocal);
+  tvBindMulti(&tmpTV, tvLocal);
   if (inited) {
     vmStack().pushTrue();
   } else {
@@ -6769,6 +12492,7 @@ OPTBLD_INLINE void iopStaticLoc(IOP_ARGS) {
   }
 }
 
+// No idea how to trigger this
 OPTBLD_INLINE void iopStaticLocInit(IOP_ARGS) {
   pc++;
   auto localId = decode_la(pc);
@@ -6784,10 +12508,12 @@ OPTBLD_INLINE void iopStaticLocInit(IOP_ARGS) {
 
   auto const tvLocal = frame_local(vmfp(), localId);
   auto const tmpTV = make_tv<KindOfRef>(refData);
-  tvBind(&tmpTV, tvLocal);
+  //tvBind(&tmpTV, tvLocal);
+  tvBindMulti(&tmpTV, tvLocal);
   vmStack().discard();
 }
 
+// Good to go
 OPTBLD_INLINE void iopCatch(IOP_ARGS) {
   pc++;
   auto vm = &*g_context;
@@ -6799,6 +12525,7 @@ OPTBLD_INLINE void iopCatch(IOP_ARGS) {
   vmStack().pushObjectNoRc(fault.m_userException);
 }
 
+// good to go
 OPTBLD_INLINE void iopLateBoundCls(IOP_ARGS) {
   pc++;
   Class* cls = frameStaticClass(vmfp());
@@ -6808,6 +12535,7 @@ OPTBLD_INLINE void iopLateBoundCls(IOP_ARGS) {
   vmStack().pushClass(cls);
 }
 
+// Skip the verification if param is multival
 OPTBLD_INLINE void iopVerifyParamType(IOP_ARGS) {
   vmpc() = pc; // We might need vmpc() to be updated to throw.
   pc++;
@@ -6819,7 +12547,13 @@ OPTBLD_INLINE void iopVerifyParamType(IOP_ARGS) {
   const TypeConstraint& tc = func->params()[paramId].typeConstraint;
   assert(tc.hasConstraint());
   if (!tc.isTypeVar()) {
-    tc.verifyParam(frame_local(vmfp(), paramId), func, paramId);
+    auto cur_param = frame_local(vmfp(), paramId);
+    //if (UNLIKELY(MultiVal::containMultiVal(cur_param))) {
+      //debug_log << "    meet a multival, and we skip the verifyParam\n";
+    //} else {
+    //}
+    // FIXME: BUMMER! I commented out the below line to avoid calling the above line
+    //tc.verifyParam(cur_param, func, paramId);
   }
 }
 
@@ -6833,41 +12567,238 @@ OPTBLD_INLINE void implVerifyRetType(PC& pc) {
   const auto func = vmfp()->m_func;
   const auto tc = func->returnTypeConstraint();
   if (!tc.isTypeVar()) {
+    // cheng-hack:
+    // TODO: this is not tested yet.
+    if (UNLIKELY(vmStack().topTV()->m_type == KindOfMulti)) {
+      auto multi_val = vmStack().topTV();
+      // assume there is no side effect inside
+      tc.verifyReturn(multi_val->m_data.pmulti->getByVal(0), func);
+    } else {
+    // normal case
     tc.verifyReturn(vmStack().topTV(), func);
+    }
   }
 }
 
+// Support by implVerifyRetType()
 OPTBLD_INLINE void iopVerifyRetTypeC(IOP_ARGS) {
   implVerifyRetType(pc);
 }
 
+// Support by implVerifyRetType()
 OPTBLD_INLINE void iopVerifyRetTypeV(IOP_ARGS) {
   implVerifyRetType(pc);
 }
 
+// support
 OPTBLD_INLINE void iopNativeImpl(IOP_ARGS) {
+  AS_CALL;
   pc++;
   BuiltinFunction func = vmfp()->func()->builtinFuncPtr();
   assert(func);
+
+#ifdef CHENG_COUNT_INS
+    nested_ins_level_inc();
+#endif
+  // cheng-hack:
+  // TODO: this is not tested yet.
+  // otherwise, the compiler will complain the goto 
+  ActRec* sfp = nullptr;
+  Offset soff {0}; 
+
+  // NOTE: similar code to FCallBuiltin, but have no idea how to
+  // make it more graceful. =.=
+  TypedValue* rargs = vmStack().topTV();
+  int32_t numArgs = vmfp()->func()->numParams();
+
+  bool multi_call = false, multi_this = false; // whether we should do multicall
+  bool multi_var_arglist = false;
+  ArrayData* orig_var_arglist = nullptr;
+//  bool is_multi[numArgs] = {false};
+  bool is_multi[numArgs];
+  memset(is_multi, 0, numArgs*sizeof(bool));
+  int multival_num = 0, call_num = 0;  // how many multivalue in args
+  // NOTE: since stack grow to low address, 
+  // args is the high address; rargs is the low address
+  for (int i = 0; i < numArgs; i++) {
+    if (rargs[i].m_type == KindOfMulti) {
+      multi_call = true;
+      is_multi[i] = true;
+      multival_num++;
+      if (call_num == 0) call_num = rargs[i].m_data.pmulti->valSize();
+    }
+  }
+  // cheng-hack: check variable-length argument list
+  if (numArgs == 2 && rargs[0].m_type == KindOfArray) {
+    // might be variable-length argument list, check
+    orig_var_arglist = rargs[0].m_data.parr->copy();
+    for (ArrayIter iter(rargs[0]); iter; ++iter) {
+      if (iter.second().m_type == KindOfMulti) {
+#ifdef CHENG_INS_DEBUG
+        debug_log << "    During NativeImpl, meet the variable-length argument list\n";
+#endif
+        multi_call = true;
+        multi_var_arglist = true;
+        call_num = iter.second().m_data.pmulti->valSize();
+      }
+    }
+  }
+  // POINT2: if multi_this
+  sptr< std::vector<ObjectData*> > orig_multi_this = nullptr;
+  if (UNLIKELY(vmfp()->isMultiThis())) {
+      orig_multi_this = vmfp()->getThisMulti();
+      multi_this = true;
+      call_num = orig_multi_this->size();
+  }
+  // check if builtin function should be bypass
+  if (UNLIKELY( (multi_call || multi_this) 
+                && isBypassFunc(vmfp()->func()->name()->data()))) {
+    multi_call = false;
+    multi_this = false;
+  }
+
+  // call_counter indicates which turn are we in
+  int call_counter = 0;
+  TypedValue result;
+  TypedValue orig_stack[numArgs];
+  struct ActRec orig_ar;
+  struct Stack orig_stack_ptr;
+
+
+  if (UNLIKELY(multi_call || multi_this)) {START; AS_MCALL;}
+
+multicall_begin:
+  if (UNLIKELY(multi_call || multi_this)) {
+    /* (1) Keep the argument list and ActRec structure
+     * (FIXME: what if side effect?)
+     * (2) collect result and check if end
+     * (3) recover the argument list and ActRec with single value
+     */
+    // (3) Initial everything in the very beginning
+    if (call_counter == 0) {
+#ifdef CHENG_INS_DEBUG
+    debug_log << "  NativeImpl [" << vmfp()->func()->name()->data() << "] with " << multival_num
+      << " multi values, multi_var_arglist: " << multi_var_arglist << "; Args are: \n";
+    for (int i = 0; i < numArgs; i++) {
+      debug_log << "    " << rargs[i].pretty();
+      debug_log << ((is_multi[i]) ? ("\n"+rargs[i].m_data.pmulti->dump("    ")) : "\n");
+    }
+#endif
+      result = MultiVal::makeMultiVal();
+      vmfp()->setInMultiRound(true);
+      memcpy(orig_stack, rargs, sizeof(struct TypedValue)*numArgs);
+      memcpy(&orig_ar, vmfp(), sizeof(struct ActRec));
+      orig_stack_ptr = vmStack();
+    }
+
+    // collect the result, and check if end
+    if (call_counter > 0) {
+      TypedValue* ret = vmStack().topTV();
+      result.m_data.pmulti->addValue(*ret);
+#ifdef CHENG_INS_DEBUG
+      debug_log << "  Iter[" << call_counter << "], result is:" 
+        << ret->pretty() << "\n";
+#endif
+    }
+    if (call_counter >= call_num) {
+      // restore the argument on the stack, in case the free will
+      // free the element inside multi-value
+      memcpy(rargs, orig_stack, sizeof(TypedValue)*numArgs); // recover to original args
+      // this is end, THERE IS NO RETURN!
+      TypedValue* ret = vmStack().topTV();
+      tvCopy(result, *ret);
+      END;
+      single_mode_on = false;
+#ifdef CHENG_INS_ONLY_DEBUG
+    debug_log << "single_mode_on = false\n";
+#endif
+      single_mode_cur_iter = -1;
+      goto multicall_end;
+    }
+
+    // prepare the single value call args
+    // FIXME: if there is one single value which has side effect,
+    // what should we do?
+    vmStack() = orig_stack_ptr;
+    memcpy(rargs, orig_stack, sizeof(TypedValue)*numArgs); // recover to original args
+    memcpy(vmfp(), &orig_ar, sizeof(struct ActRec));
+    for (int i = 0; i < numArgs; i++) {
+      // need change multi to single
+      if (is_multi[i]) {
+#ifdef CHENG_CHECK
+      cheng_assert(rargs[i].m_type == KindOfMulti);
+#endif
+        TypedValue *tmptv = rargs[i].m_data.pmulti->getByVal(call_counter);
+        tvDup(*tmptv, rargs[i]); // this will increase the inner counter
+      }
+    }
+    if (multi_var_arglist) {
+      orig_var_arglist->incRefCount();
+      for (ArrayIter iter(orig_var_arglist); iter; ++iter) {
+        auto arr = rargs[0].m_data.parr;
+        if (iter.second().m_type == KindOfMulti) {
+          auto tmpv = iter.second().m_data.pmulti->getByVal(call_counter);
+          arr->set(iter.first(), tvAsVariant(tmpv), false);
+        } else {
+          arr->set(iter.first(), iter.second(), false);
+        }
+      }
+    }
+    // POINT2: if this is the __construct for builtin class
+    if (multi_this) {
+#ifdef CHENG_INS_DEBUG
+      debug_log << "    Meet multi-this, choose " << call_counter << " one\n";
+#endif
+      vmfp()->setThisSingle(orig_multi_this->at(call_counter));
+    }
+
+    // If we are here, it means we are not in single mode
+    single_mode_on = true;
+#ifdef CHENG_INS_ONLY_DEBUG
+    debug_log << "single_mode_on = true\n";
+#endif
+    single_mode_cur_iter = call_counter;
+    single_mode_size = call_num;
+
+    call_counter++;
+    // if it is last round, free as normal
+    if (call_counter == call_num) {
+      vmfp()->setInMultiRound(false);
+      // FIXME: how to do it correctly to free the copied ArrayData?
+      //decRefArr(orig_var_arglist);
+    }
+  }
+
   // Actually call the native implementation. This will handle freeing the
   // locals in the normal case. In the case of an exception, the VM unwinder
   // will take care of it.
   func(vmfp());
 
   // Grab caller info from ActRec.
-  ActRec* sfp = vmfp()->sfp();
-  Offset soff = vmfp()->m_soff;
+  sfp = vmfp()->sfp();
+  soff = vmfp()->m_soff;
 
   // Adjust the stack; the native implementation put the return value in the
   // right place for us already
   vmStack().ndiscard(vmfp()->func()->numSlotsInFrame());
   vmStack().ret();
 
+  // cheng-hack:
+  if (UNLIKELY(multi_call || multi_this)) {
+    goto multicall_begin;
+  }
+multicall_end:
+
   // Return control to the caller.
   vmfp() = sfp;
   pc = LIKELY(vmfp() != nullptr) ? vmfp()->func()->getEntry() + soff : nullptr;
+
+#ifdef CHENG_COUNT_INS
+    nested_ins_level_dec();
+#endif
 }
 
+// Good to go
 OPTBLD_INLINE void iopSelf(IOP_ARGS) {
   pc++;
   Class* clss = arGetContextClass(vmfp());
@@ -6877,6 +12808,7 @@ OPTBLD_INLINE void iopSelf(IOP_ARGS) {
   vmStack().pushClass(clss);
 }
 
+// Good to go
 OPTBLD_INLINE void iopParent(IOP_ARGS) {
   pc++;
   Class* clss = arGetContextClass(vmfp());
@@ -6890,6 +12822,7 @@ OPTBLD_INLINE void iopParent(IOP_ARGS) {
   vmStack().pushClass(parent);
 }
 
+// Good to go
 OPTBLD_INLINE void iopCreateCl(IOP_ARGS) {
   pc++;
   auto numArgs = decode_iva(pc);
@@ -6903,6 +12836,7 @@ OPTBLD_INLINE void iopCreateCl(IOP_ARGS) {
 
 const StaticString s_this("this");
 
+// Good to go?
 OPTBLD_INLINE void iopCreateCont(IOP_ARGS) {
   pc++;
   auto const fp = vmfp();
@@ -6938,7 +12872,8 @@ OPTBLD_INLINE void iopCreateCont(IOP_ARGS) {
 }
 
 static inline BaseGenerator* this_base_generator(const ActRec* fp) {
-  auto const obj = fp->getThis();
+  // cheng-hack: no idea
+  auto const obj = fp->getThisSingle();
   assert(obj->instanceof(c_AsyncGenerator::classof()) ||
          obj->instanceof(c_Generator::classof()));
   return static_cast<BaseGenerator*>(obj);
@@ -6972,10 +12907,12 @@ OPTBLD_INLINE void contEnterImpl(PC& pc) {
   EventHook::FunctionResumeYield(vmfp());
 }
 
+// No idea
 OPTBLD_INLINE void iopContEnter(IOP_ARGS) {
   contEnterImpl(pc);
 }
 
+// No idea
 OPTBLD_INLINE void iopContRaise(IOP_ARGS) {
   contEnterImpl(pc);
   iopThrow(pc);
@@ -7020,6 +12957,7 @@ OPTBLD_INLINE void yield(PC& pc, const Cell* key, const Cell value) {
   pc = sfp != nullptr ? sfp->func()->getEntry() + soff : nullptr;
 }
 
+// No idea
 OPTBLD_INLINE void iopYield(IOP_ARGS) {
   pc++;
   auto const value = *vmStack().topC();
@@ -7027,6 +12965,7 @@ OPTBLD_INLINE void iopYield(IOP_ARGS) {
   yield(pc, nullptr, value);
 }
 
+// No idea
 OPTBLD_INLINE void iopYieldK(IOP_ARGS) {
   pc++;
   auto const key = *vmStack().indC(1);
@@ -7035,18 +12974,21 @@ OPTBLD_INLINE void iopYieldK(IOP_ARGS) {
   yield(pc, &key, value);
 }
 
+// No idea
 OPTBLD_INLINE void iopContCheck(IOP_ARGS) {
   pc++;
   auto checkStarted = decode_iva(pc);
   this_base_generator(vmfp())->preNext(checkStarted);
 }
 
+// No idea
 OPTBLD_INLINE void iopContValid(IOP_ARGS) {
   pc++;
   vmStack().pushBool(
     this_generator(vmfp())->getState() != BaseGenerator::State::Done);
 }
 
+// No idea
 OPTBLD_INLINE void iopContKey(IOP_ARGS) {
   pc++;
   c_Generator* cont = this_generator(vmfp());
@@ -7054,6 +12996,7 @@ OPTBLD_INLINE void iopContKey(IOP_ARGS) {
   cellDup(cont->m_key, *vmStack().allocC());
 }
 
+// No idea
 OPTBLD_INLINE void iopContCurrent(IOP_ARGS) {
   pc++;
   c_Generator* cont = this_generator(vmfp());
@@ -7148,6 +13091,7 @@ OPTBLD_INLINE void asyncSuspendR(PC& pc) {
   pc = sfp != nullptr ? sfp->func()->getEntry() + soff : nullptr;
 }
 
+// No idea
 OPTBLD_INLINE void iopAwait(IOP_ARGS) {
   pc++;
   auto iters = decode_iva(pc);
@@ -7172,13 +13116,14 @@ OPTBLD_INLINE void iopAwait(IOP_ARGS) {
   }
 }
 
+// No idea
 OPTBLD_INLINE void iopCheckProp(IOP_ARGS) {
   pc++;
   auto propName = decode_litstr(pc);
 
   auto* cls = vmfp()->getClass();
   auto* propVec = cls->getPropData();
-  always_assert(propVec);
+  cheng_assert(propVec!=nullptr);
 
   auto* ctx = arGetContextClass(vmfp());
   auto idx = ctx->lookupDeclProp(propName);
@@ -7191,6 +13136,7 @@ OPTBLD_INLINE void iopCheckProp(IOP_ARGS) {
   }
 }
 
+// No idea
 OPTBLD_INLINE void iopInitProp(IOP_ARGS) {
   pc++;
   auto propName = decode_litstr(pc);
@@ -7209,7 +13155,7 @@ OPTBLD_INLINE void iopInitProp(IOP_ARGS) {
 
     case InitPropOp::NonStatic: {
       auto* propVec = cls->getPropData();
-      always_assert(propVec);
+      cheng_assert(propVec!=nullptr);
       Slot idx = ctx->lookupDeclProp(propName);
       tv = &(*propVec)[idx];
     } break;
@@ -7219,9 +13165,81 @@ OPTBLD_INLINE void iopInitProp(IOP_ARGS) {
   vmStack().popC();
 }
 
+// cheng-hack: 
+// new bytecode for add_multi value
+// this will change the multi-value *in-place*
+OPTBLD_INLINE void iopAddMulti(IOP_ARGS) {
+  pc++;
+  Cell* reqnum = vmStack().topC();
+  Cell* value = vmStack().indC(1);
+  Cell* multi = vmStack().indC(2);
+
+#ifdef CHENG_CHECK
+  cheng_assert(multi->m_type == KindOfMulti || 
+                multi->m_type == KindOfNull ||
+                multi->m_type == KindOfUninit);
+  cheng_assert(reqnum->m_type == KindOfInt64);
+#endif
+
+  START;
+
+  if (LIKELY(multi->m_type == KindOfMulti)) {
+    MultiVal* mv = multi->m_data.pmulti;
+    mv->addValue(*value);
+  } else if (multi->m_type == KindOfNull || multi->m_type == KindOfUninit) {
+    *multi = MultiVal::makeMultiVal();
+    multi->m_data.pmulti->addValue(*value);
+  } else {
+    std::cout << "ERROR: Cannot add a value to a non-multi-value variable!\n";
+    cheng_assert(false);
+  }
+  vmStack().popC();
+  vmStack().popC();
+#ifdef CHENG_INS_DEBUG
+  debug_log << "  After add_multi: \n" << vmStack().topC()->m_data.pmulti->dump("  ");
+#endif
+
+  END;
+}
+
+// support
 OPTBLD_INLINE void iopStrlen(IOP_ARGS) {
+  AS_ARITH;
   pc++;
   TypedValue* subj = vmStack().topTV();
+
+  // cheng-hack:
+  if (UNLIKELY(subj->m_type == KindOfMulti)) {
+    START;
+    TypedValue result = MultiVal::makeMultiVal();
+    for (auto it : *subj->m_data.pmulti) {
+      TypedValue ret;
+      ret.m_type = KindOfInt64;
+      if (LIKELY(IS_STRING_TYPE(it->m_type))) {
+        int64_t ans = it->m_data.pstr->size();
+        ret.m_data.num = ans;
+      } else {
+        Variant vret = HHVM_FN(strlen)(tvAsVariant(it));
+        ret.m_data.num = vret.getInt64();
+      }
+      result.m_data.pmulti->addValue(ret);
+    }
+    // Optmize:
+    // check if the results are the same, shrink them if true
+    auto single = result.m_data.pmulti->shrinkToSingle();
+    if (single == nullptr) {
+      tvCopy(result, *subj);
+    } else {
+#ifdef CHENG_INS_DEBUG
+      debug_log << "    Shrink the result to single: " << single->pretty() << "\n";
+#endif
+      tvCopy(*single, *subj);
+      // free the read_result
+      tvRefcountedDecRef(&result);
+    }
+    END;
+  } else {
+  // normal case
   if (LIKELY(IS_STRING_TYPE(subj->m_type))) {
     int64_t ans = subj->m_data.pstr->size();
     tvRefcountedDecRef(subj);
@@ -7231,8 +13249,10 @@ OPTBLD_INLINE void iopStrlen(IOP_ARGS) {
     Variant ans = HHVM_FN(strlen)(tvAsVariant(subj));
     tvAsVariant(subj) = ans;
   }
+  }
 }
 
+// No idea
 OPTBLD_INLINE void iopIncStat(IOP_ARGS) {
   pc++;
   auto counter = decode_iva(pc);
@@ -7240,6 +13260,7 @@ OPTBLD_INLINE void iopIncStat(IOP_ARGS) {
   Stats::inc(Stats::StatCounter(counter), value);
 }
 
+// No idea
 OPTBLD_INLINE void iopOODeclExists(IOP_ARGS) {
   pc++;
   auto subop = decode<OODeclExistsOp>(pc);
@@ -7263,6 +13284,7 @@ OPTBLD_INLINE void iopOODeclExists(IOP_ARGS) {
   tvAsVariant(name) = Unit::classExists(name->m_data.pstr, autoload, kind);
 }
 
+// No idea
 OPTBLD_INLINE void iopSilence(IOP_ARGS) {
   pc++;
   auto localId = decode_la(pc);
@@ -7473,6 +13495,10 @@ void dispatchImpl() {
   PC pc = vmpc();
   DISPATCH();
 
+#ifndef CHENG_INS_ONLY_DEBUG
+
+#ifndef CHENG_TIME_EVAL
+// original
 #define O(name, imm, push, pop, flags)                        \
   LabelDbg##name:                                             \
     phpDebuggerOpcodeHook(pc);                                \
@@ -7498,6 +13524,72 @@ void dispatchImpl() {
     }                                                         \
     DISPATCH();                                               \
   }
+
+
+#else
+
+#define O(name, imm, push, pop, flags)                        \
+  LabelDbg##name:                                             \
+    phpDebuggerOpcodeHook(pc);                                \
+  LabelCover##name:                                           \
+    if (collectCoverage) {                                    \
+      recordCodeCoverage(pc);                                 \
+    }                                                         \
+  Label##name: {                                              \
+    ins_counter_inc();\
+    iop##name(pc);                                            \
+    vmpc() = pc;                                              \
+    if (breakOnCtlFlow) {                                     \
+      isCtlFlow = instrIsControlFlow(Op::name);               \
+      Stats::incOp(Op::name);                                 \
+    }                                                         \
+    if (UNLIKELY(!pc)) {                                      \
+      DEBUG_ONLY const Op op = Op::name;                      \
+      assert(op == OpRetC || op == OpRetV ||                  \
+             op == OpAwait || op == OpCreateCont ||           \
+             op == OpYield || op == OpYieldK ||               \
+             op == OpNativeImpl);                             \
+      vmfp() = nullptr;                                       \
+      return;                                                 \
+    }                                                         \
+    DISPATCH();                                               \
+  }
+#endif // CHENG_TIME_EVAL
+
+#else
+  // here is define CHENG_INS_ONLY_DEBUG
+
+#define O(name, imm, push, pop, flags)                        \
+  LabelDbg##name:                                             \
+    phpDebuggerOpcodeHook(pc);                                \
+  LabelCover##name:                                           \
+    if (collectCoverage) {                                    \
+      recordCodeCoverage(pc);                                 \
+    }                                                         \
+  Label##name: {                                              \
+    ins_counter_inc();\
+    printFullStack("");\
+    print_ins(#name);\
+    iop##name(pc);                                            \
+    vmpc() = pc;                                              \
+    if (breakOnCtlFlow) {                                     \
+      isCtlFlow = instrIsControlFlow(Op::name);               \
+      Stats::incOp(Op::name);                                 \
+    }                                                         \
+    if (UNLIKELY(!pc)) {                                      \
+      DEBUG_ONLY const Op op = Op::name;                      \
+      assert(op == OpRetC || op == OpRetV ||                  \
+             op == OpAwait || op == OpCreateCont ||           \
+             op == OpYield || op == OpYieldK ||               \
+             op == OpNativeImpl);                             \
+      vmfp() = nullptr;                                       \
+      return;                                                 \
+    }                                                         \
+    DISPATCH();                                               \
+  }
+
+#endif // CHENG_INS_ONLY_DEBUG
+
   OPCODES
 #undef O
 #undef DISPATCH
@@ -7564,6 +13656,7 @@ void ExecutionContext::popVMState() {
     vmfp() = nullptr;
     vmpc() = nullptr;
     vmFirstAR() = nullptr;
+
     return;
   }
 
@@ -7663,6 +13756,80 @@ void ExecutionContext::requestInit() {
 
 void ExecutionContext::requestExit() {
   MemoryProfile::finishProfiling();
+
+  // cheng-hack: when leaving close the debug log
+  flush_clock_cpu_time();
+  thread_end();
+#ifdef CHENG_INS_ONLY_DEBUG
+  closeDebugLog();
+#endif
+#ifdef CHENG_TIME_EVAL
+  STOP_SW(req_time);
+  t_mtx.lock();
+  std::ofstream otf1("/tmp/veri/php_runtime.log", std::ofstream::app);
+  otf1 << GET_TIME(req_time) << ",";
+  otf1.close();
+  std::ofstream otf2("/tmp/veri/multi_runtime.log", std::ofstream::app);
+  otf2 << GET_TIME(multi_time) << ",";
+  otf2.close();
+  std::ofstream otf3("/tmp/veri/ins_count.log", std::ofstream::app);
+  otf3 << ins_counter << ",";
+  otf3.close();
+  std::ofstream otf4("/tmp/veri/multi_ins_count.log", std::ofstream::app);
+  otf4 << GET_COUNT(multi_time) << ",";
+  otf4.close();
+  std::ofstream otf5("/tmp/veri/db_runtime.log", std::ofstream::app);
+  otf5 << GET_TIME(db_query) << ",";
+  otf5.close();
+
+
+  std::ofstream prof_of_1("/tmp/veri/db_dedup.log", std::ofstream::app);
+  prof_of_1 << GET_TIME(db_dedup_time) << ",";
+  prof_of_1.close();
+  std::ofstream prof_of_2("/tmp/veri/db_trans.log", std::ofstream::app);
+  prof_of_2 << GET_TIME(db_trans_time) << ",";
+  prof_of_2.close();
+  std::ofstream prof_of_3("/tmp/veri/apc_time.log", std::ofstream::app);
+  prof_of_3 << GET_TIME(apc_time) << ",";
+  prof_of_3.close();
+  std::ofstream prof_of_4("/tmp/veri/opmap_time.log", std::ofstream::app);
+  prof_of_4 << GET_TIME(opmap_time) << ",";
+  prof_of_4.close();
+
+
+  t_mtx.unlock();
+  RESET_SW(req_time);
+  RESET_SW(multi_time);
+  RESET_SW(db_query);
+
+  RESET_SW(db_dedup_time);
+  RESET_SW(db_trans_time);
+  RESET_SW(apc_time);
+  RESET_SW(opmap_time);
+
+  START_SW(req_time); // may be running multiple times
+  START_SW(multi_time);
+  // FIXME: this popVMState() is not actually the real end!
+  // but cannot find one so far.
+  ins_counter = 0;
+#endif
+#ifdef CHENG_CYCLE_WAR_TUNING
+  std::ofstream ins_of("/tmp/veri/cw_ins_time.log", std::ofstream::app);
+  ins_of << GET_TIME(ins_time) << "|" << GET_COUNT(ins_time) << "\n";
+  ins_of.close();
+  std::ofstream ins_of_1("/tmp/veri/cw_ins_time1.log", std::ofstream::app);
+  ins_of_1 << GET_TIME(ins_time_1) << "|" << GET_COUNT(ins_time_1) << "\n";
+  ins_of_1.close();
+  std::ofstream ins_of_2("/tmp/veri/cw_ins_time2.log", std::ofstream::app);
+  ins_of_2 << GET_TIME(ins_time_2) << "|" << GET_COUNT(ins_time_2) << "\n";
+  ins_of_2.close();
+  std::ofstream ins_of_3("/tmp/veri/cw_ins_time3.log", std::ofstream::app);
+  ins_of_3 << GET_TIME(ins_time_3) << "|" << GET_COUNT(ins_time_3) << "\n";
+  ins_of_3.close();
+  std::ofstream ins_of_4("/tmp/veri/cw_ins_time4.log", std::ofstream::app);
+  ins_of_4 << GET_TIME(ins_time_4) << "|" << GET_COUNT(ins_time_4) << "\n";
+  ins_of_4.close();
+#endif
 
   manageAPCHandle();
   syncGdbState();

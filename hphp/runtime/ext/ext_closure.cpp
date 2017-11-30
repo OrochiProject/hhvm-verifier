@@ -110,9 +110,16 @@ void c_Closure::init(int numArgs, ActRec* ar, TypedValue* sp) {
   if (ar->hasThis()) {
     if (invokeFunc->attrs() & AttrStatic) {
       // Only set the class for static closures.
-      setClass(ar->getThis()->getVMClass());
+      // cheng-hack
+      setClass(ar->getThisDefault()->getVMClass());
     } else {
-      ar->getThis()->incRefCount();
+      // cheng-hack:
+      if (UNLIKELY(ar->isMultiThis())) {
+        for (auto it : *ar->getThisMulti()) { it->incRefCount(); }
+      } else {
+        // normal case
+      ar->getThisSingle()->incRefCount();
+      }
     }
   }
 

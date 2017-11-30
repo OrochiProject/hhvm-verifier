@@ -224,7 +224,8 @@ bool EventHook::RunInterceptHandler(ActRec* ar) {
   Variant called_on;
 
   if (ar->hasThis()) {
-    called_on = Variant(ar->getThis());
+    // cheng-hack: no idea
+    called_on = Variant(ar->getThisSingle());
   } else if (ar->hasClass()) {
     // For static methods, give handler the name of called class
     called_on = Variant(const_cast<StringData*>(ar->getClass()->name()));

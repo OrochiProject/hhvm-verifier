@@ -46,9 +46,11 @@ void HHVM_FUNCTION(flush);
 Variant HHVM_FUNCTION(ob_get_contents);
 Variant HHVM_FUNCTION(ob_get_clean);
 Variant HHVM_FUNCTION(ob_get_flush);
-int64_t HHVM_FUNCTION(ob_get_length);
+Variant HHVM_FUNCTION(ob_get_length); // cheng-hack
+//int64_t HHVM_FUNCTION(ob_get_length);
 int64_t HHVM_FUNCTION(ob_get_level);
-Array HHVM_FUNCTION(ob_get_status, bool full_status = false);
+Variant HHVM_FUNCTION(ob_get_status, bool full_status = false); // cheng-hack
+//Array HHVM_FUNCTION(ob_get_status, bool full_status = false);
 void HHVM_FUNCTION(ob_implicit_flush, bool flag = true);
 Array HHVM_FUNCTION(ob_list_handlers);
 bool HHVM_FUNCTION(output_add_rewrite_var, const String& name,

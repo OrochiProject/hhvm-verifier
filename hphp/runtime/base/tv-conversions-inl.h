@@ -24,7 +24,9 @@
 namespace HPHP {
 
 //////////////////////////////////////////////////////////////////////
+// cheng-hack:
 
+extern bool cheng_cellToBool(Cell *cell);
 inline bool cellToBool(Cell cell) {
   assert(cellIsPlausible(cell));
 
@@ -41,6 +43,20 @@ inline bool cellToBool(Cell cell) {
     case KindOfResource:      return cell.m_data.pres->o_toBoolean();
     case KindOfRef:
     case KindOfClass:         break;
+    case KindOfMulti:
+          {
+            int size = cell.m_data.pmulti->valSize();
+            bool first = true, ret = false;
+            for (int i =0; i< size; i++) {
+              if (first) {
+                ret = cheng_cellToBool(cell.m_data.pmulti->getByVal(i));
+                first = false;
+              } else {
+                always_assert(cheng_cellToBool(cell.m_data.pmulti->getByVal(i)) == ret);
+              }
+            }
+            return ret;
+          }
   }
   not_reached();
 }
@@ -60,6 +76,7 @@ inline int64_t cellToInt(Cell cell) {
     case KindOfObject:        return cell.m_data.pobj->toInt64();
     case KindOfResource:      return cell.m_data.pres->o_toInt64();
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:         break;
   }
   not_reached();

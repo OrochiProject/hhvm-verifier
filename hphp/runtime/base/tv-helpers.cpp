@@ -70,9 +70,13 @@ bool cellIsPlausible(const Cell cell) {
       case KindOfRef:
         assert(!"KindOfRef found in a Cell");
         break;
+      case KindOfMulti:
+        return;
       case KindOfClass:
         assert(!"Invalid Cell type");
         break;
+      default:
+        assert(!"UNKONW TYPE");
     }
     not_reached();
   }();
@@ -91,7 +95,8 @@ bool tvIsPlausible(TypedValue tv) {
 }
 
 bool refIsPlausible(const Ref ref) {
-  assert(ref.m_type == KindOfRef);
+  assert(ref.m_type == KindOfRef ||
+         (ref.m_type == KindOfMulti && ref.m_data.pmulti->getType() == KindOfRef));
   return tvIsPlausible(ref);
 }
 
@@ -105,10 +110,64 @@ bool tvDecRefWillRelease(TypedValue* tv) {
   return !tv->m_data.pstr->hasMultipleRefs();
 }
 
+// cheng-hack:
+bool inline cheng_tvCastToBoolean(TypedValue* tv) {
+  assert(tvIsPlausible(*tv));
+  tvUnboxIfNeeded(tv);
+  bool b;
+
+  do {
+    switch (tv->m_type) {
+      case KindOfUninit:
+      case KindOfNull:
+        b = false;
+        continue;
+
+      case KindOfBoolean:
+      case KindOfInt64:
+        b = (tv->m_data.num != 0LL);
+        continue;
+
+      case KindOfDouble:
+        b = (tv->m_data.dbl != 0);
+        continue;
+
+      case KindOfStaticString:
+        b = tv->m_data.pstr->toBoolean();
+        continue;
+
+      case KindOfString:
+        b = tv->m_data.pstr->toBoolean();
+        continue;
+
+      case KindOfArray:
+        b = !!tv->m_data.parr->size();
+        continue;
+
+      case KindOfObject:
+        b = tv->m_data.pobj->toBoolean();
+        continue;
+
+      case KindOfResource:
+        b = tv->m_data.pres->o_toBoolean();
+        continue;
+
+      case KindOfMulti:
+      case KindOfRef:
+      case KindOfClass:
+        break;
+    }
+    not_reached();
+  } while (0);
+
+  return b;
+}
+
 void tvCastToBooleanInPlace(TypedValue* tv) {
   assert(tvIsPlausible(*tv));
   tvUnboxIfNeeded(tv);
   bool b;
+  bool is_first = true;
 
   do {
     switch (tv->m_type) {
@@ -150,6 +209,19 @@ void tvCastToBooleanInPlace(TypedValue* tv) {
       case KindOfResource:
         b = tv->m_data.pres->o_toBoolean();
         tvDecRefRes(tv);
+        continue;
+
+      case KindOfMulti:
+        // cheng-hack: make sure everything is the same
+        for (auto it : *tv->m_data.pmulti) {
+          if (is_first) {
+            is_first = false;
+            b = cheng_tvCastToBoolean(it);
+          } else {
+            always_assert(b == cheng_tvCastToBoolean(it));
+          }
+        }
+        tvDecRef(tv);
         continue;
 
       case KindOfRef:
@@ -209,6 +281,7 @@ void tvCastToDoubleInPlace(TypedValue* tv) {
         continue;
 
       case KindOfRef:
+      case KindOfMulti:
       case KindOfClass:
         break;
     }
@@ -265,6 +338,7 @@ void cellCastToInt64InPlace(Cell* cell) {
         continue;
 
       case KindOfRef:
+      case KindOfMulti:
       case KindOfClass:
         break;
     }
@@ -315,6 +389,7 @@ double tvCastToDouble(TypedValue* tv) {
       return tv->m_data.pres->o_toDouble();
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -370,6 +445,7 @@ void tvCastToStringInPlace(TypedValue* tv) {
         return;
 
       case KindOfRef:
+      case KindOfMulti:
       case KindOfClass:
         break;
     }
@@ -429,6 +505,7 @@ StringData* tvCastToString(const TypedValue* tv) {
         return tv->m_data.pres->o_toString().detach();
 
       case KindOfRef:
+      case KindOfMulti:
       case KindOfClass:
         break;
     }
@@ -475,6 +552,10 @@ void tvCastToArrayInPlace(TypedValue* tv) {
         a = ArrayData::Create(tvAsVariant(tv));
         tvDecRefRes(tv);
         continue;
+
+      case KindOfMulti:
+        // this should only used by FCallArray()
+        break;
 
       case KindOfRef:
       case KindOfClass:
@@ -524,6 +605,7 @@ void tvCastToObjectInPlace(TypedValue* tv) {
         return;
 
       case KindOfRef:
+      case KindOfMulti:
       case KindOfClass:
         break;
     }
@@ -566,6 +648,7 @@ void tvCastToResourceInPlace(TypedValue* tv) {
         // no op, return
         return;
       case KindOfRef:
+      case KindOfMulti:
       case KindOfClass:
         break;
     }
@@ -593,6 +676,7 @@ bool tvCoerceParamToBooleanInPlace(TypedValue* tv) {
       return false;
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -627,6 +711,7 @@ bool tvCanBeCoercedToNumber(TypedValue* tv) {
       return false;
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -677,6 +762,7 @@ bool tvCoerceParamToStringInPlace(TypedValue* tv) {
       return false;
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }
@@ -704,6 +790,7 @@ bool tvCoerceParamToArrayInPlace(TypedValue* tv) {
       return true;
 
     case KindOfRef:
+    case KindOfMulti:
     case KindOfClass:
       break;
   }

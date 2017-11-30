@@ -32,20 +32,16 @@
 #ifdef __INTEL_COMPILER
 #define not_reached()                                                \
   do {                                                               \
-    assert(false);                                                   \
+    always_assert(false);                                            \
   } while (true)
 #else
 #define not_reached() /* gcc-4.5 supports __builtin_unreachable() */  \
   do {                                                                \
-    assert(false);                                                    \
+    always_assert(false);                                                    \
     __builtin_unreachable();                                          \
   } while (true)
 #endif
 
-template<typename T>
-T bad_value() {
-  not_reached();
-}
 
 #define not_implemented() do {                   \
   fprintf(stderr, "not implemented: %s:%d %s\n", \
@@ -158,6 +154,10 @@ const bool do_assert =
 #endif
   ;
 
+template<typename T>
+T bad_value() {
+  not_reached();
+}
 //////////////////////////////////////////////////////////////////////
 
 #endif
